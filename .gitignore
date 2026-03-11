@@ -1,0 +1,38 @@
+# Python runtime (embedded, ~35k files)
+python/
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Local / temp
+.local/
+.tmp/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# Credentials / secrets
+.env
+*.key
+*.pem
+
+# WhaleClaw runtime data
+.whaleclaw/
