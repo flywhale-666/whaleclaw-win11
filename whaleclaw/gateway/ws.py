@@ -324,6 +324,42 @@ async def websocket_handler(
                     data=base64.b64encode(resized.data).decode("ascii"),
                 ))
 
+            # Persist uploaded images to local files and append markdown
+            # paths to the message text so downstream consumers (e.g.
+            # nano-banana) can extract local image paths — matching the
+            # behaviour of the Feishu channel.
+            if images:
+                _webchat_media_dir = (
+                    Path.home() / ".whaleclaw" / "media" / "webchat"
+                )
+                _webchat_media_dir.mkdir(parents=True, exist_ok=True)
+                img_lines: list[str] = []
+                for idx, img in enumerate(images, start=1):
+                    suffix = {
+                        "image/png": ".png",
+                        "image/jpeg": ".jpg",
+                        "image/gif": ".gif",
+                        "image/webp": ".webp",
+                    }.get(img.mime, ".png")
+                    fname = f"{uuid4().hex[:12]}{suffix}"
+                    dest = _webchat_media_dir / fname
+                    try:
+                        dest.write_bytes(base64.b64decode(img.data))
+                        img_lines.append(
+                            f"![用户图片{idx}]({dest.resolve()})"
+                        )
+                    except Exception:
+                        log.warning(
+                            "ws.image_persist_failed",
+                            session_id=session.id,
+                        )
+                if img_lines:
+                    md_block = "\n".join(img_lines)
+                    if content:
+                        content = f"{content}\n\n{md_block}"
+                    else:
+                        content = md_block
+
             raw_attachments_obj = incoming.payload.get("attachments", [])
             raw_attachments = (
                 cast(list[object], raw_attachments_obj)

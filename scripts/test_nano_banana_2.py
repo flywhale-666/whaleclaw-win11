@@ -7,7 +7,7 @@ import os
 import sys
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
@@ -116,7 +116,7 @@ def run_text_to_image(
     if not isinstance(items, list) or not items:
         raise RuntimeError(f"文生图返回格式异常: {data}")
 
-    image_bytes = _extract_image_bytes(items[0], client)
+    image_bytes = _extract_image_bytes(cast(dict[str, Any], items[0]), client)
     _save_image(image_bytes, output_path)
 
 
@@ -166,7 +166,7 @@ def run_image_to_image(
     if not isinstance(items, list) or not items:
         raise RuntimeError(f"图生图返回格式异常: {data}")
 
-    image_bytes = _extract_image_bytes(items[0], client)
+    image_bytes = _extract_image_bytes(cast(dict[str, Any], items[0]), client)
     _save_image(image_bytes, output_path)
 
 
@@ -322,8 +322,10 @@ def main() -> int:
     args.edit_model = _normalize_model_name(str(args.edit_model)) or default_model
 
     out_dir = Path(args.out_dir)
-    text_output = out_dir / "text_to_image.png"
-    edit_output = out_dir / "image_to_image.png"
+    from datetime import datetime as _dt
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    text_output = out_dir / f"text_to_image_{_ts}.png"
+    edit_output = out_dir / f"image_to_image_{_ts}.png"
 
     if args.model == args.edit_model:
         print(f"当前使用模型: {_display_model_name(args.model)}")

@@ -1367,7 +1367,11 @@ def _format_nano_banana_success_reply(
     lines = [f"当前使用模型：{model_display}", lead]
     if image_path:
         lines.append(f"![结果图]({image_path})")
-        lines.append(f"文件路径：{image_path}")
+        # Use forward slashes so Feishu auto-link detection does not
+        # misparse Windows paths like "C:\Users\X\.whaleclaw" into
+        # "C:\Users\X.whaleclaw" (backslash+dot gets swallowed).
+        display_path = image_path.replace("\\", "/")
+        lines.append(f"文件路径：{display_path}")
     return "\n".join(lines)
 
 
@@ -2229,6 +2233,22 @@ async def run_agent(
             if isinstance(raw_pending_switch_message, str):
                 pending_switch_message = raw_pending_switch_message.strip()
 
+        # If the user uploads images while locked on nano-banana, the
+        # pending switch was likely a false-positive from an earlier round.
+        # Clear it and proceed with the current skill.
+        if (
+            pending_switch_skill_ids
+            and pending_switch_message
+            and images
+            and any(sid in ("nano-banana-image-t8",) for sid in locked_skill_ids)
+        ):
+            pending_switch_skill_ids = []
+            pending_switch_message = ""
+            if session is not None:
+                session.metadata.pop("pending_skill_switch_ids", None)
+                session.metadata.pop("pending_skill_switch_message", None)
+                metadata_dirty = True
+
         if pending_switch_skill_ids and pending_switch_message:
             if _is_skill_switch_consent(
                 message,
@@ -2258,7 +2278,7 @@ async def run_agent(
                 current_skills = "、".join(locked_skill_ids)
                 return (
                     f"当前会话仍锁定在 {current_skills} 技能。"
-                    f"如果你确实要切换到 {requested_skills}，请明确回复“同意切换技能”；"
+                    f'如果你确实要切换到 {requested_skills}，请明确回复\u201c同意切换技能\u201d；'
                     "否则可以直接继续当前技能的操作。"
                 )
 
@@ -2332,12 +2352,7 @@ async def run_agent(
                         session.id,
                         metadata=session.metadata,
                     )
-            if (
-                session_store
-                and router
-                and summarizer_cfg.enabled
-                and group_compressor is None
-            ):
+            if session_store and router and summarizer_cfg.enabled:
                 _fire_bg_compress(
                     session_id=session_id,
                     session_store=session_store,
@@ -2388,6 +2403,19 @@ async def run_agent(
                 metadata_dirty = True
         elif not locked_skill_ids and lockable_skill_ids:
             pending_lock_skill_ids = lockable_skill_ids
+
+        # When user uploads images while locked on an image-processing skill,
+        # the attached "(用户发送了图片)" text may falsely trigger other skills
+        # like search_images.  Suppress the switch check in this case.
+        _suppress_switch = (
+            lock_is_explicit
+            and locked_skill_ids
+            and images
+            and any(sid in ("nano-banana-image-t8",) for sid in locked_skill_ids)
+        )
+        if _suppress_switch and routed_skill_ids and routed_skill_ids != locked_skill_ids:
+            routed_skill_ids = []
+            routed_skills = []
 
         if (
             lock_is_explicit
@@ -2549,12 +2577,7 @@ async def run_agent(
                         for s in guards
                         if s.param_guard is not None
                     ]
-                    if (
-                        session_store
-                        and router
-                        and summarizer_cfg.enabled
-                        and group_compressor is None
-                    ):
+                    if session_store and router and summarizer_cfg.enabled:
                         _fire_bg_compress(
                             session_id=session_id,
                             session_store=session_store,
@@ -2592,7 +2615,7 @@ async def run_agent(
                     tc = ToolCall(
                         id="nano_banana_fixed_runner",
                         name="bash",
-                        arguments={"command": command, "timeout": 180},
+                        arguments={"command": command, "timeout": 330},
                     )
                     if session_manager is not None:
                         await _persist_message(
@@ -2646,12 +2669,7 @@ async def run_agent(
                         )
                         if session_manager is not None:
                             await _persist_message(session_manager, session, "assistant", final_text)
-                        if (
-                            session_store
-                            and router
-                            and summarizer_cfg.enabled
-                            and group_compressor is None
-                        ):
+                        if session_store and router and summarizer_cfg.enabled:
                             _fire_bg_compress(
                                 session_id=session_id,
                                 session_store=session_store,
@@ -2665,12 +2683,7 @@ async def run_agent(
                     )
                     if session_manager is not None:
                         await _persist_message(session_manager, session, "assistant", fail_text)
-                    if (
-                        session_store
-                        and router
-                        and summarizer_cfg.enabled
-                        and group_compressor is None
-                    ):
+                    if session_store and router and summarizer_cfg.enabled:
                         _fire_bg_compress(
                             session_id=session_id,
                             session_store=session_store,

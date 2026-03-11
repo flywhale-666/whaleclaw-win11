@@ -26,6 +26,19 @@ if defined PID (
 
 %PSH% "Write-Host ''; Write-Host ([regex]::Unescape('  \uD83D\uDC0B WhaleClaw Gateway \u6B63\u5728\u542F\u52A8...')); Write-Host ([regex]::Unescape('  \uD83C\uDF89 B\u7AD9\u98DE\u7FD4\u9CB8\u795D\u60A8\u9A6C\u5E74\u5927\u5409\uFF01\u8D22\u6E90\u5E7F\u8FDB\uFF01WhaleClaw \u514D\u8D39\u5F00\u6E90\uFF01')); Write-Host '  ---------------------------------'; Write-Host ''; Write-Host ('  ' + [regex]::Unescape('\uD83C\uDF10 WebChat:  http://') + '%BIND%' + ':' + '%PORT%'); Write-Host ('  ' + [regex]::Unescape('\uD83D\uDCE1 API:      http://') + '%BIND%' + ':' + '%PORT%' + '/api/status'); Write-Host ('  ' + [regex]::Unescape('\uD83D\uDD0C WS:       ws://') + '%BIND%' + ':' + '%PORT%' + '/ws'); Write-Host ''; Write-Host ([regex]::Unescape('  \u6309 Ctrl+C \u505C\u6B62\u670D\u52A1')); Write-Host '  ---------------------------------'; Write-Host ''"
 
+REM Pre-flight: check whaleclaw is importable
+"%PYTHON_EXE%" -c "import whaleclaw" >nul 2>&1
+if errorlevel 1 (
+    %PSH% "Write-Host ([regex]::Unescape('[WhaleClaw] \u68C0\u6D4B\u5230 whaleclaw \u6A21\u5757\u672A\u5B89\u88C5, \u6B63\u5728\u81EA\u52A8\u5B89\u88C5\u4F9D\u8D56...'))"
+    "%PYTHON_EXE%" -m pip install -e "%~dp0." >nul 2>&1
+    if errorlevel 1 (
+        %PSH% "Write-Host ([regex]::Unescape('[WhaleClaw] \u81EA\u52A8\u5B89\u88C5\u5931\u8D25, \u8BF7\u5148\u8FD0\u884C \u5B89\u88C5\u4F9D\u8D56.bat'))"
+        pause
+        exit /b 1
+    )
+    %PSH% "Write-Host ([regex]::Unescape('[WhaleClaw] \u4F9D\u8D56\u5B89\u88C5\u5B8C\u6210.'))"
+)
+
 "%PYTHON_EXE%" -X utf8 -m whaleclaw.entry
 set "EXIT_CODE=%ERRORLEVEL%"
 
