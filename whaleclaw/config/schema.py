@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from whaleclaw.config.paths import WORKSPACE_DIR
+from whaleclaw.mcp.config import McpConfig
 
 
 class AuthConfig(BaseModel):
@@ -173,4 +174,5 @@ class WhaleclawConfig(BaseModel):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
     plugins: dict[str, dict[str, object]] = Field(default_factory=dict)

@@ -36,9 +36,12 @@ class ToolGuardUpdate:
 @dataclass(slots=True)
 class ToolGuardState:
     recent_signatures: list[str] = field(default_factory=list)
+    recent_fuzzy_signatures: list[str] = field(default_factory=list)
     loop_detect_window: int = 3
     loop_warning_signature: str = ""
     loop_block_signature: str = ""
+    fuzzy_loop_warning_signature: str = ""
+    fuzzy_loop_block_signature: str = ""
     browser_fail_streak: int = 0
     search_images_count: int = 0
     planned_image_count: int | None = None
@@ -80,6 +83,64 @@ def is_low_value_bash_probe(tc: ToolCall) -> bool:
 def normalize_bash_command_signature(command: str) -> str:
     """Normalize bash command text for repeated-failure detection."""
     return re.sub(r"\s+", " ", command.strip())
+
+
+_BASH_NOISE_RE = re.compile(
+    r"\s*2>\s*\$null\b|"           # 2>$null
+    r"\s*2>/dev/null\b|"           # 2>/dev/null
+    r"\s*--output\s+\w+|"         # --output json / --output text
+    r"\s*\|\s*Select-Object[^;|]*",  # | Select-Object ...
+    re.IGNORECASE,
+)
+
+# For CLI tools like mcporter/npx, extract just the core command skeleton:
+# "mcporter call dingtalk-ai-table list_bases limit=10" -> "mcporter call dingtalk-ai-table list_bases"
+_CLI_CALL_RE = re.compile(
+    r"^((?:npx\s+)?(?:mcporter|mcp\w*)\s+(?:call|list|config)\s+\S+(?:\s+\S+)?)"
+    r"(?:\s+.*)?$",
+    re.IGNORECASE,
+)
+
+# Generic key=value args that should be stripped for fuzzy matching
+_KV_ARG_RE = re.compile(r"\s+\w+=\S+")
+# --flag value pairs
+_FLAG_ARG_RE = re.compile(r"\s+--\w+(?:\s+\S+)?")
+
+
+def _fuzzy_tool_signature(tc: "ToolCall") -> str:
+    """Build a fuzzy signature for a tool call, ignoring minor arg variations.
+
+    For bash commands, strips stderr redirects, output format flags,
+    key=value arguments, etc.  For CLI tools like mcporter, extracts
+    just the command skeleton (e.g. "mcporter call server tool").
+    For other tools, uses only the tool name + sorted argument keys.
+    """
+    if tc.name == "bash":
+        cmd = str(tc.arguments.get("command", "")).strip()
+        # Strip noise patterns
+        cleaned = _BASH_NOISE_RE.sub("", cmd).strip()
+        # For CLI call commands, extract just the skeleton
+        cli_match = _CLI_CALL_RE.match(cleaned)
+        if cli_match:
+            cleaned = cli_match.group(1).strip()
+        else:
+            # For other bash commands, strip key=value and --flag args
+            cleaned = _KV_ARG_RE.sub("", cleaned)
+            cleaned = _FLAG_ARG_RE.sub("", cleaned)
+        # Collapse whitespace
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return f"bash:{cleaned}"
+    # For browser: include action + url/text so different pages count as
+    # different operations (research), but same page counts as repeat.
+    if tc.name == "browser":
+        action = str(tc.arguments.get("action", "")).strip().lower()
+        url = str(tc.arguments.get("url", "")).strip()
+        text = str(tc.arguments.get("text", "")).strip()
+        distinguisher = url or text
+        return f"browser:{action}:{distinguisher}"
+    # For other tools: tool name + sorted arg keys (ignore values)
+    keys = sorted(tc.arguments.keys()) if tc.arguments else []
+    return f"{tc.name}:{','.join(keys)}"
 
 
 def tail_repeat_count(items: list[str]) -> int:
@@ -310,20 +371,47 @@ def apply_post_round_guards(
             "禁止继续调用 search_images。请立即进入生成或编辑步骤。"
         )
 
+    # --- Filter out tool calls that have their own dedicated guard ---
+    # search_images has its own repeat/quota detection, and browser navigate
+    # naturally visits different URLs each time (research/browsing).  These
+    # should not count toward the generic loop detector.
+    generic_tcs = [tc for tc in tool_calls if not is_search_images_call(tc)]
+
+    # If every tool call in this round is search_images, skip generic loop detection
+    if not generic_tcs:
+        state.recent_signatures.append("")
+        state.recent_fuzzy_signatures.append("")
+        return update
+
+    # --- Exact signature detection (original) ---
     sig_parts: list[str] = []
-    for tc in tool_calls:
+    for tc in generic_tcs:
         arg_str = json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)[:200]
         sig_parts.append(f"{tc.name}:{arg_str}")
     round_sig = hashlib.md5("|".join(sig_parts).encode()).hexdigest()  # noqa: S324
     state.recent_signatures.append(round_sig)
     exact_repeat_count = tail_repeat_count(state.recent_signatures)
-    repeated_tools = sorted({tc.name for tc in tool_calls})
+
+    # --- Fuzzy signature detection (new) ---
+    fuzzy_parts = [_fuzzy_tool_signature(tc) for tc in generic_tcs]
+    fuzzy_sig = hashlib.md5("|".join(fuzzy_parts).encode()).hexdigest()  # noqa: S324
+    state.recent_fuzzy_signatures.append(fuzzy_sig)
+    fuzzy_repeat_count = tail_repeat_count(state.recent_fuzzy_signatures)
+
+    # Use the higher of exact vs fuzzy repeat count for detection
+    effective_repeat = max(exact_repeat_count, fuzzy_repeat_count)
+    repeated_tools = sorted({tc.name for tc in generic_tcs})
     repeated_tools_text = "、".join(repeated_tools) or "当前工具"
+
+    # Warning: repeated >= window (default 3)
     if (
-        exact_repeat_count >= state.loop_detect_window
+        effective_repeat >= state.loop_detect_window
         and round_sig != state.loop_warning_signature
+        and fuzzy_sig != state.fuzzy_loop_warning_signature
     ):
         state.loop_warning_signature = round_sig
+        state.fuzzy_loop_warning_signature = fuzzy_sig
+        is_fuzzy = fuzzy_repeat_count > exact_repeat_count
         update.log_events.append(
             GuardLogEvent(
                 level="warning",
@@ -333,19 +421,29 @@ def apply_post_round_guards(
                     "rounds": round_idx + 1,
                     "repeated_tools": repeated_tools,
                     "exact_repeat_count": exact_repeat_count,
+                    "fuzzy_repeat_count": fuzzy_repeat_count,
+                    "fuzzy_match": is_fuzzy,
                 },
             )
         )
         update.conversation_messages.append(
             "[系统提示] 检测到你在重复执行相似操作且未取得进展。"
-            f"重复工具：{repeated_tools_text}。"
-            "请立刻换一种方式解决问题，不要继续沿用同一套路。"
+            f"重复工具：{repeated_tools_text}（连续 {effective_repeat} 轮）。"
+            "你必须立刻改变策略：\n"
+            "1. 跳过所有前置检查、守门规则、schema 验证、版本检查等预检步骤。\n"
+            "2. 直接执行用户要求的核心操作（如创建、查询、修改等）。\n"
+            "3. 改变参数、加减重定向、换输出格式不算改变策略。\n"
+            "如果核心操作也失败，直接告诉用户结果，不要再重试。"
         )
+
+    # Block: repeated >= window + 1 (default 4)
     if (
-        exact_repeat_count >= (state.loop_detect_window + 1)
+        effective_repeat >= (state.loop_detect_window + 1)
         and round_sig != state.loop_block_signature
+        and fuzzy_sig != state.fuzzy_loop_block_signature
     ):
         state.loop_block_signature = round_sig
+        state.fuzzy_loop_block_signature = fuzzy_sig
         newly_blocked = [name for name in repeated_tools if name not in state.blocked_tools]
         if newly_blocked:
             state.blocked_tools.update(newly_blocked)
@@ -357,7 +455,7 @@ def apply_post_round_guards(
                         "session_id": session_id or "",
                         "rounds": round_idx + 1,
                         "blocked_tools": newly_blocked,
-                        "repeat_count": exact_repeat_count,
+                        "repeat_count": effective_repeat,
                     },
                 )
             )
@@ -367,7 +465,9 @@ def apply_post_round_guards(
                 "后续禁止继续调用它们。"
                 "请改用其他工具或更直接的方案完成任务。"
             )
-    if exact_repeat_count >= (state.loop_detect_window + 2):
+
+    # Hard stop: repeated >= window + 2 (default 5)
+    if effective_repeat >= (state.loop_detect_window + 2):
         update.final_texts.append(
             "检测到任务陷入重复循环，已自动中止当前路径。"
             "请让我改用更直接的方式继续完成任务。"
@@ -388,4 +488,5 @@ __all__ = [
     "normalize_bash_command_signature",
     "tail_repeat_count",
     "update_planned_image_count",
+    "_fuzzy_tool_signature",
 ]

@@ -108,6 +108,10 @@ def _categorize_tool_name(name: str) -> str:
     }
     if name in explicit:
         return explicit[name]
+    if name.startswith("mcp__"):
+        return "mcp"
+    if name.startswith("mcp_"):
+        return "mcp"
     if name.startswith("evomap_"):
         return "integration"
     if name.startswith("feishu_"):
@@ -304,6 +308,7 @@ def _as_str_object_dict(value: object) -> dict[str, object]:
 
 def create_app(config: WhaleclawConfig) -> FastAPI:
     """Create and configure the FastAPI application."""
+    from whaleclaw.mcp.manager import McpManager
 
     store = SessionStore()
     cron_store = CronStore(_CRON_DB_PATH)
@@ -386,6 +391,15 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         await _load_plugins(config, registry, plugin_registry, hook_manager)
         state["registry"] = registry
+
+        # --- MCP servers ---
+        from whaleclaw.mcp.manager import McpManager
+        from whaleclaw.tools.mcp_manage import McpManageTool
+
+        mcp_manager = McpManager()
+        state["mcp_manager"] = mcp_manager
+        await mcp_manager.start(config.mcp, registry)
+        registry.register(McpManageTool(mcp_manager))
 
         await plugin_registry.start_all()
         await cron_scheduler.start()
@@ -506,6 +520,9 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         compressor = state["group_compressor"]
         if isinstance(compressor, SessionGroupCompressor):
             await compressor.shutdown()
+        mcp_mgr = state.get("mcp_manager")
+        if isinstance(mcp_mgr, McpManager):
+            await mcp_mgr.stop()
         await cron_scheduler.stop()
         await plugin_registry.stop_all()
         await cron_store.close()
@@ -578,7 +595,251 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             "plugins": {
                 "evomap": {"enabled": evomap_enabled},
             },
+            "mcp": {
+                "servers": len(config.mcp.servers),
+                "tools": (
+                    state["mcp_manager"].get_tool_count()
+                    if state.get("mcp_manager") is not None
+                    and hasattr(state["mcp_manager"], "get_tool_count")
+                    else 0
+                ),
+            },
         }
+
+    # ── MCP ─────────────────────────────────────────────────
+
+    @app.get("/api/mcp/servers")
+    async def _api_mcp_list_servers() -> dict[str, Any]:
+        """List all connected MCP servers and their tools.
+
+        Also includes servers managed by external CLI tools like mcporter.
+        """
+        servers: list[dict[str, Any]] = []
+        mgr = state.get("mcp_manager")
+        if isinstance(mgr, McpManager):
+            servers.extend(mgr.list_servers())
+
+        # Also list mcporter-managed servers
+        try:
+            import asyncio
+            import shutil
+            import subprocess
+
+            mcporter_bin = shutil.which("mcporter")
+            npx_bin = shutil.which("npx") if not mcporter_bin else None
+            shell_cmd = (
+                "mcporter list --json"
+                if mcporter_bin
+                else "npx mcporter list --json"
+                if npx_bin
+                else ""
+            )
+            if shell_cmd:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    shell_cmd,
+                    capture_output=True,
+                    timeout=15,
+                    shell=True,
+                )
+                stdout = proc.stdout.decode("utf-8", errors="replace")
+                if proc.returncode == 0 and stdout.strip():
+                    import json as _json
+                    data = _json.loads(stdout)
+                    mcporter_servers: list[dict[str, Any]] = []
+                    if isinstance(data, list):
+                        mcporter_servers = data
+                    elif isinstance(data, dict) and "servers" in data:
+                        mcporter_servers = data["servers"]
+                    existing_ids = {s.get("id") for s in servers}
+                    for ms in mcporter_servers:
+                        sid = str(ms.get("id") or ms.get("name", "")).strip()
+                        if not sid or sid in existing_ids:
+                            continue
+                        tools = ms.get("tools", [])
+                        tool_names = (
+                            [str(t.get("name", "")) for t in tools]
+                            if isinstance(tools, list) and tools and isinstance(tools[0], dict)
+                            else [str(t) for t in tools] if isinstance(tools, list)
+                            else []
+                        )
+                        raw_transport = str(
+                            ms.get("transport", ms.get("type", "mcporter"))
+                        )
+                        # Strip sensitive URL details from transport string
+                        if "http" in raw_transport.lower() and "://" in raw_transport:
+                            from urllib.parse import urlparse
+                            parsed = urlparse(raw_transport.split()[-1])
+                            safe_transport = f"HTTP {parsed.scheme}://{parsed.netloc}/..."
+                        else:
+                            safe_transport = raw_transport
+                        servers.append({
+                            "id": sid,
+                            "transport": safe_transport,
+                            "tool_count": int(
+                                ms.get("tool_count", ms.get("toolCount", len(tool_names)))
+                            ),
+                            "tools": tool_names,
+                            "source": "mcporter",
+                        })
+        except Exception:
+            pass  # mcporter not available or parse error, skip silently
+
+        return {"servers": servers}
+
+    @app.post("/api/mcp/servers/{server_id}/reconnect")
+    async def _api_mcp_reconnect(server_id: str) -> dict[str, Any]:
+        """Reconnect an MCP server and re-discover its tools."""
+        mgr = state.get("mcp_manager")
+        if not isinstance(mgr, McpManager):
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=503,
+                content={"error": "MCP manager not available"},
+            )
+        try:
+            tool_count = await mgr.reconnect_server(server_id)
+            return {"status": "ok", "server_id": server_id, "tools": tool_count}
+        except Exception as exc:
+            return JSONResponse(  # type: ignore[return-value]
+                status_code=500,
+                content={"error": str(exc)},
+            )
+
+    @app.post("/api/mcp/servers")
+    async def _api_mcp_add_server(body: dict[str, Any]) -> JSONResponse:
+        """Add a new MCP server at runtime and persist to config."""
+        mgr = state.get("mcp_manager")
+        if not isinstance(mgr, McpManager):
+            return JSONResponse(
+                status_code=503,
+                content={"error": "MCP manager not available"},
+            )
+        server_id = str(body.get("server_id", "")).strip()
+        if not server_id:
+            return JSONResponse({"error": "缺少 server_id"}, status_code=400)
+
+        transport = str(body.get("transport", "streamable_http")).strip()
+        url = str(body.get("url", "")).strip()
+        command = str(body.get("command", "")).strip()
+        args_raw = body.get("args", [])
+        args_list: list[str] = []
+        if isinstance(args_raw, list):
+            args_list = [str(a) for a in args_raw]
+        env_raw = body.get("env", {})
+        env_dict: dict[str, str] = {}
+        if isinstance(env_raw, dict):
+            env_dict = {str(k): str(v) for k, v in env_raw.items()}
+        headers_raw = body.get("headers", {})
+        headers_dict: dict[str, str] = {}
+        if isinstance(headers_raw, dict):
+            headers_dict = {str(k): str(v) for k, v in headers_raw.items()}
+        timeout = int(body.get("timeout", 30))
+
+        from whaleclaw.mcp.config import McpServerConfig
+
+        server_cfg = McpServerConfig(
+            transport=transport,  # type: ignore[arg-type]
+            url=url,
+            command=command,
+            args=args_list,
+            env=env_dict,
+            headers=headers_dict,
+            timeout=timeout,
+            enabled=True,
+        )
+        try:
+            tool_count = await mgr.add_server(server_id, server_cfg)
+        except Exception as exc:
+            return JSONResponse(
+                {"error": f"连接 MCP 服务器失败: {exc}"}, status_code=500
+            )
+
+        # Persist to config file
+        user_cfg = _read_json_config(CONFIG_FILE)
+        mcp_block = _as_str_object_dict(user_cfg.get("mcp", {}))
+        user_cfg["mcp"] = mcp_block
+        servers_block = _as_str_object_dict(mcp_block.get("servers", {}))
+        mcp_block["servers"] = servers_block
+        servers_block[server_id] = server_cfg.model_dump()
+        try:
+            _write_json_config(CONFIG_FILE, user_cfg)
+        except Exception as exc:
+            log.warning("mcp.persist_failed", error=str(exc))
+
+        return JSONResponse({
+            "ok": True,
+            "server_id": server_id,
+            "tools": tool_count,
+        })
+
+    @app.delete("/api/mcp/servers/{server_id}")
+    async def _api_mcp_remove_server(
+        server_id: str,
+        source: str = "",
+    ) -> JSONResponse:
+        """Remove an MCP server and unregister its tools.
+
+        If ``source=mcporter``, remove via ``mcporter config remove``.
+        Otherwise remove from the built-in MCP manager.
+        """
+        if source == "mcporter":
+            import asyncio
+            import shutil
+            import subprocess
+
+            mcporter_bin = shutil.which("mcporter")
+            shell_cmd = (
+                f"mcporter config remove {server_id}"
+                if mcporter_bin
+                else f"npx mcporter config remove {server_id}"
+                if shutil.which("npx")
+                else ""
+            )
+            if not shell_cmd:
+                return JSONResponse(
+                    {"error": "mcporter CLI 未安装"}, status_code=400
+                )
+            try:
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    shell_cmd,
+                    capture_output=True,
+                    timeout=15,
+                    shell=True,
+                )
+                if proc.returncode != 0:
+                    err = proc.stderr.decode("utf-8", errors="replace").strip()
+                    return JSONResponse(
+                        {"error": f"mcporter 删除失败: {err}"}, status_code=500
+                    )
+            except Exception as exc:
+                return JSONResponse({"error": str(exc)}, status_code=500)
+            return JSONResponse({"ok": True, "server_id": server_id})
+
+        mgr = state.get("mcp_manager")
+        if not isinstance(mgr, McpManager):
+            return JSONResponse(
+                status_code=503,
+                content={"error": "MCP manager not available"},
+            )
+        try:
+            await mgr.remove_server(server_id)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+        # Remove from persisted config
+        user_cfg = _read_json_config(CONFIG_FILE)
+        mcp_block = _as_str_object_dict(user_cfg.get("mcp", {}))
+        servers_block = _as_str_object_dict(mcp_block.get("servers", {}))
+        servers_block.pop(server_id, None)
+        mcp_block["servers"] = servers_block
+        user_cfg["mcp"] = mcp_block
+        try:
+            _write_json_config(CONFIG_FILE, user_cfg)
+        except Exception as exc:
+            log.warning("mcp.persist_remove_failed", error=str(exc))
+
+        return JSONResponse({"ok": True, "server_id": server_id})
 
     # ── Models ───────────────────────────────────────────────
 
@@ -796,7 +1057,10 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         if not skill:
             return JSONResponse({"error": "技能不存在"}, status_code=404)
         installed_ids = {s.id for s in mgr.list_installed()}
-        raw_content = skill.source_path.read_text(encoding="utf-8")
+        try:
+            raw_content = skill.source_path.read_text(encoding="utf-8")
+        except Exception as exc:
+            return JSONResponse({"error": f"读取技能内容失败: {exc}"}, status_code=500)
         return {
             "id": skill.id,
             "name": skill.name,

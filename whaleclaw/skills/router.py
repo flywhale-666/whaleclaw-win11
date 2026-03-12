@@ -26,28 +26,57 @@ class SkillRouter:
                     return [s]
 
         # Explicit skill mention in natural language:
-        # e.g. "用 ppt-generator 这个技能" / "use skill ppt-generator".
-        if any(marker in lower for marker in ("技能", "skill")):
-            explicit: list[Skill] = []
-            for s in available_skills:
-                if self._mentions_skill(msg, s):
-                    explicit.append(s)
-            if explicit:
-                explicit.sort(key=lambda x: x.id)
-                return explicit[:max_skills]
+        # e.g. "用 ppt-generator 这个技能" / "use skill ppt-generator"
+        # or just mentioning the skill name directly.
+        explicit: list[Skill] = []
+        for s in available_skills:
+            if self._mentions_skill(msg, s):
+                explicit.append(s)
+        if explicit:
+            explicit.sort(key=lambda x: x.id)
+            return explicit[:max_skills]
 
         scored = [(self._score(msg, s), s) for s in available_skills]
         scored = [(score, s) for score, s in scored if score > 0]
         scored.sort(key=lambda x: (-x[0], x[1].id))
         return [s for _, s in scored[:max_skills]]
 
+    _AUTOTRIGGER_SPLIT_RE = re.compile(r"[，,、/\s]+")
+
+    def _auto_triggers(self, skill: Skill) -> list[str]:
+        """Derive triggers from name + description when triggers list is empty."""
+        tokens: list[str] = []
+        if skill.name:
+            tokens.extend(
+                t for t in self._AUTOTRIGGER_SPLIT_RE.split(skill.name) if len(t) >= 2
+            )
+            tokens.append(skill.name)
+        if skill.id:
+            tokens.append(skill.id)
+            tokens.append(skill.id.replace("-", " "))
+        if skill.trigger_description:
+            tokens.extend(
+                t
+                for t in self._AUTOTRIGGER_SPLIT_RE.split(skill.trigger_description)
+                if len(t) >= 2
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for t in tokens:
+            key = t.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                out.append(t.strip())
+        return out
+
     def _score(self, message: str, skill: Skill) -> float:
         """Return hit_count / total_triggers, 0 if no triggers."""
-        if not skill.triggers:
+        triggers = skill.triggers if skill.triggers else self._auto_triggers(skill)
+        if not triggers:
             return 0.0
         lower = message.lower()
-        hits = sum(1 for t in skill.triggers if t.lower() in lower)
-        return hits / len(skill.triggers)
+        hits = sum(1 for t in triggers if t.lower() in lower)
+        return hits / len(triggers)
 
     @staticmethod
     def _norm_text(text: str) -> str:

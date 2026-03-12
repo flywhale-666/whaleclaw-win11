@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -142,7 +144,7 @@ class SkillManager:
         skill_id = src.name
         dest = _USER_SKILLS_DIR / skill_id
         if dest.exists():
-            shutil.rmtree(dest)
+            shutil.rmtree(dest, onexc=self._force_remove_readonly)
         shutil.copytree(src, dest)
         log.info("skill.installed", skill_id=skill_id, source=str(src))
         return self._parser.parse(dest / "SKILL.md")
@@ -224,11 +226,25 @@ class SkillManager:
 
             return self._install_from_local(src)
 
+    @staticmethod
+    def _force_remove_readonly(
+        func: object,
+        path: str,
+        exc: BaseException,
+    ) -> None:
+        """Handle read-only files on Windows (e.g. .git pack objects)."""
+        if isinstance(exc, PermissionError):
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            if callable(func):
+                func(path)
+            return
+        raise exc
+
     def uninstall(self, skill_id: str) -> bool:
         """Remove an installed skill by ID. Returns True if removed."""
         target = _USER_SKILLS_DIR / skill_id
         if target.exists() and target.is_dir():
-            shutil.rmtree(target)
+            shutil.rmtree(target, onexc=self._force_remove_readonly)
             log.info("skill.uninstalled", skill_id=skill_id)
             return True
         return False

@@ -622,6 +622,17 @@ class BashTool(Tool):
         if exit_code == 0:
             _postprocess_delivery_files(out, command)
 
+        # Truncate excessively long output to avoid overwhelming the LLM context
+        _SOFT_LIMIT = 8000
+        if len(out) > _SOFT_LIMIT:
+            head = out[:_SOFT_LIMIT // 2]
+            tail = out[-_SOFT_LIMIT // 2:]
+            out = (
+                f"{head}\n\n"
+                f"... [输出过长，已截断中间 {len(out) - _SOFT_LIMIT} 字符] ...\n\n"
+                f"{tail}"
+            )
+
         output = out
         if err:
             output += f"\n[stderr]\n{err}"

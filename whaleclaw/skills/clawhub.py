@@ -12,6 +12,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import threading
 import time
@@ -25,6 +26,21 @@ from typing import cast
 from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
+
+
+def _force_remove_readonly(
+    func: object,
+    path: str,
+    exc: BaseException,
+) -> None:
+    """Handle read-only files on Windows (e.g. .git pack objects)."""
+    if isinstance(exc, PermissionError):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        if callable(func):
+            func(path)
+        return
+    raise exc
+
 
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$")
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL | re.MULTILINE)
@@ -449,11 +465,10 @@ def get_clawhub_auth_status(
         api_token=api_token,
     )
     try:
-        out = _run(["clawhub", "whoami"], env=env)
-        msg = out.strip() or "logged in"
-        return {"logged_in": True, "message": msg}
-    except Exception as exc:
-        return {"logged_in": False, "message": _clean_cli_error(str(exc))}
+        _run(["clawhub", "whoami"], env=env)
+        return {"logged_in": True, "message": "已登录"}
+    except Exception:
+        return {"logged_in": False, "message": "未登录"}
 
 
 def login_clawhub_cli(
@@ -1393,6 +1408,8 @@ def search_skills(
             api_token=api_token,
             limit=search_limit,
         )
+    except ClawHubCliError:
+        raise
     except Exception as exc:
         raise ClawHubCliError(f"HTTP 搜索失败: {_clean_cli_error(str(exc))}") from exc
     if items:
@@ -1557,15 +1574,45 @@ def _resolve_clawhub_global_config_path() -> Path:
 
 
 def _read_clawhub_global_config() -> dict[str, object]:
+    """Read clawhub global config, merging token from legacy path if needed."""
     path = _resolve_clawhub_global_config_path()
-    if not path.is_file():
-        return {}
-    with contextlib.suppress(Exception):
-        raw = path.read_text(encoding="utf-8")
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return {str(k): v for k, v in parsed.items() if isinstance(k, str)}
-    return {}
+    cfg: dict[str, object] = {}
+    if path.is_file():
+        with contextlib.suppress(Exception):
+            raw = path.read_text(encoding="utf-8")
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                cfg = {str(k): v for k, v in parsed.items() if isinstance(k, str)}
+
+    # If primary config has no token, try the legacy path (clawdhub → clawhub
+    # rename migration).  This prevents 429 when logout only cleared one file.
+    token = str(cfg.get("token", "")).strip()
+    if not token:
+        legacy = _resolve_legacy_config_path()
+        if legacy is not None and legacy != path and legacy.is_file():
+            with contextlib.suppress(Exception):
+                legacy_raw = legacy.read_text(encoding="utf-8")
+                legacy_parsed = json.loads(legacy_raw)
+                if isinstance(legacy_parsed, dict):
+                    legacy_token = str(legacy_parsed.get("token", "")).strip()
+                    if legacy_token:
+                        cfg["token"] = legacy_token
+    return cfg
+
+
+def _resolve_legacy_config_path() -> Path | None:
+    """Return the legacy clawdhub config path (if different from primary)."""
+    home = Path.home()
+    system = platform.system()
+    if system == "Darwin":
+        base = home / "Library" / "Application Support"
+    elif system == "Windows":
+        app_data = os.environ.get("APPDATA", "").strip()
+        base = Path(app_data).expanduser() if app_data else home / "AppData" / "Roaming"
+    else:
+        xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
+        base = Path(xdg).expanduser() if xdg else home / ".config"
+    return base / "clawdhub" / "config.json"
 
 
 def _iter_publish_files(skill_dir: Path) -> list[tuple[str, bytes, str]]:
@@ -1642,6 +1689,14 @@ def _publish_via_http(
     return response.text.strip() or f"OK. Published {skill_slug}@{skill_version}"
 
 
+def _resolve_effective_token(api_token: str | None) -> str:
+    """Return the best available token: explicit arg > global config."""
+    if api_token:
+        return api_token
+    cfg = _read_clawhub_global_config()
+    return str(cfg.get("token", "")).strip()
+
+
 def _search_via_http(
     *,
     query: str,
@@ -1650,9 +1705,10 @@ def _search_via_http(
     limit: int = 100,
 ) -> list[dict[str, object]]:
     base = registry_url.rstrip("/") + "/"
+    effective_token = _resolve_effective_token(api_token)
     headers: dict[str, str] = {"Accept": "application/json"}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
+    if effective_token:
+        headers["Authorization"] = f"Bearer {effective_token}"
     with httpx.Client(timeout=12, follow_redirects=True) as client:
         resp = client.get(
             f"{base}api/v1/search",
@@ -1951,9 +2007,10 @@ def _install_via_http(
     api_token: str | None,
 ) -> None:
     base = registry_url.rstrip("/") + "/"
+    effective_token = _resolve_effective_token(api_token)
     headers: dict[str, str] = {}
-    if api_token:
-        headers["Authorization"] = f"Bearer {api_token}"
+    if effective_token:
+        headers["Authorization"] = f"Bearer {effective_token}"
 
     with httpx.Client(timeout=25, follow_redirects=True) as client:
         params = {"slug": slug}
@@ -1967,7 +2024,7 @@ def _install_via_http(
     install_dir.mkdir(parents=True, exist_ok=True)
     target = install_dir / slug
     if target.exists():
-        shutil.rmtree(target)
+        shutil.rmtree(target, onexc=_force_remove_readonly)
     target.mkdir(parents=True, exist_ok=True)
 
     try:
