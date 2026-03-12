@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "dingtalk-ai-table": {
-      "baseUrl": "https://mcp-gw.dingtalk.com/server/你的URL（从钉钉MCP广场获取）"
-    }
-  },
-  "imports": []
-}
