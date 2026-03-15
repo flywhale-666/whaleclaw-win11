@@ -33,7 +33,24 @@ _PROJECT_PYTHON_CANDIDATES = (
 )
 _PROJECT_PYTHON = next((path for path in _PROJECT_PYTHON_CANDIDATES if path.is_file()), None)
 _PROJECT_PYTHON_BIN = _PROJECT_PYTHON.parent if _PROJECT_PYTHON is not None else None
+_NANO_BANANA_SCRIPT_RE = re.compile(r"test_nano_banana(?:_\d+)?\.py", re.IGNORECASE)
 _PYTHON_CMD_RE = re.compile(r"(?<![\w./-])(python3|python)(?=\s|$)")
+# LLM 有时拼出 /path/to/./python/bin/python3.12 这类含 ./ 的错误路径
+_BROKEN_PROJECT_PYTHON_RE = re.compile(
+    r"(?P<prefix>[\"']?)(?P<root>[^\s\"']*?)"
+    r"[\\/]\.[\\/]python[\\/](?:bin[\\/])?python(?:3(?:\.12)?)?"
+    r"(?:\.exe)?(?P=prefix)",
+    re.IGNORECASE,
+)
+
+
+def _fix_broken_python_path(command: str) -> str:
+    """将 LLM 拼错的 ./python/bin/python3.12 路径修正为内嵌 Python 绝对路径。"""
+    if _PROJECT_PYTHON is None:
+        return command
+    if "/./python/" not in command and "\\.\\python\\" not in command:
+        return command
+    return _BROKEN_PROJECT_PYTHON_RE.sub(lambda _m: str(_PROJECT_PYTHON), command)
 _DIRECT_PY_SCRIPT_RE = re.compile(
     r"^"
     r"(?P<prefix>(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|[^\s]+)\s+)*)"
@@ -150,6 +167,13 @@ def _prefer_project_python_for_direct_script(command: str) -> str:
     script = match.group("script")
     suffix = match.group("suffix") or ""
     return f"{prefix}{_PROJECT_PYTHON} {script}{suffix}"
+
+
+def _resolve_command_timeout(command: str, requested_timeout: int) -> int:
+    """Apply command-specific timeout floors."""
+    if _NANO_BANANA_SCRIPT_RE.search(command):
+        return max(requested_timeout, 300)
+    return requested_timeout
 
 
 def _normalize_tmp_aliases(command: str) -> str:
@@ -545,7 +569,7 @@ class BashTool(Tool):
                 ToolParameter(
                     name="timeout",
                     type="integer",
-                    description="Timeout in seconds (default 30, max 300).",
+                    description="Timeout in seconds (default 30; nano-banana commands use at least 300).",
                     required=False,
                 ),
                 ToolParameter(
@@ -562,13 +586,15 @@ class BashTool(Tool):
         command = _prefer_project_python_for_direct_script(
             _normalize_home_aliases(
                 _normalize_tmp_aliases(
-                    _normalize_project_python_aliases(
-                        _prefer_project_python(_strip_control_chars(raw_command))
+                    _fix_broken_python_path(
+                        _normalize_project_python_aliases(
+                            _prefer_project_python(_strip_control_chars(raw_command))
+                        )
                     )
                 )
             )
         )
-        timeout: int = int(kwargs.get("timeout", 30))
+        timeout = _resolve_command_timeout(command, int(kwargs.get("timeout", 30)))
         background = bool(kwargs.get("background", False))
 
         if not command.strip():

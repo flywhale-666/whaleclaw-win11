@@ -284,6 +284,11 @@ def is_office_edit_request(text: str) -> bool:
     query = text.lower()
     if not query:
         return False
+    # 如果消息的核心意图是"创建/新建"文档，不视为编辑请求
+    # （即使包含"插入"等编辑关键词，也是新建流程的一部分）
+    _create_hints = ("做一个", "创建", "新建", "生成一个", "制作一个", "帮我做一个", "帮我创建", "帮我新建")
+    if any(h in query for h in _create_hints):
+        return False
     edit_hints = (
         "改",
         "修改",
@@ -402,6 +407,10 @@ def has_any_last_office_path(metadata: dict[str, object]) -> bool:
 def is_followup_edit_message(text: str) -> bool:
     query = text.lower()
     if not query:
+        return False
+    # 创建意图不视为后续编辑
+    _create_hints = ("做一个", "创建", "新建", "生成一个", "制作一个", "帮我做一个", "帮我创建", "帮我新建")
+    if any(h in query for h in _create_hints):
         return False
     hints = (
         "改一下",

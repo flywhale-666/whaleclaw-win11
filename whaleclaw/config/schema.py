@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from whaleclaw.config.paths import WORKSPACE_DIR
 from whaleclaw.mcp.config import McpConfig
@@ -53,6 +53,8 @@ class ProviderConfig(BaseModel):
 
 class ModelsConfig(BaseModel):
     """Configuration for all LLM providers."""
+
+    model_config = ConfigDict(extra="allow")
 
     anthropic: ProviderConfig = Field(default_factory=ProviderConfig)
     openai: ProviderConfig = Field(default_factory=ProviderConfig)

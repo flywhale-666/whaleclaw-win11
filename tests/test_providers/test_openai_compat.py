@@ -175,6 +175,36 @@ def test_qwen_build_body_enables_stream_usage() -> None:
     assert body["stream_options"] == {"include_usage": True}
 
 
+def test_qwen_build_body_strips_interleaved_tool_call_history() -> None:
+    provider = QwenProvider(api_key="test-key")
+    body = provider._build_body(
+        [
+            Message(
+                role="assistant",
+                content="准备执行",
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="browser",
+                        arguments={"action": "search_images", "text": "杨幂近照"},
+                    )
+                ],
+            ),
+            Message(role="user", content="[系统提示] 禁止继续搜图"),
+            Message(role="tool", content="ok", tool_call_id="call_1"),
+            Message(role="user", content="继续"),
+        ],
+        "qwen3.5-plus",
+        None,
+    )
+
+    assert body["messages"] == [
+        {"role": "assistant", "content": "准备执行"},
+        {"role": "user", "content": "[系统提示] 禁止继续搜图"},
+        {"role": "user", "content": "继续"},
+    ]
+
+
 @pytest.mark.asyncio
 async def test_oauth_rejects_non_gpt52_model() -> None:
     provider = OpenAIProvider(

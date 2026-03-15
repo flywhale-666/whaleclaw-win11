@@ -15,6 +15,15 @@ def tool() -> BashTool:
     return BashTool()
 
 
+class _FakeProc:
+    def __init__(self) -> None:
+        self.pid = 123
+        self.returncode = 0
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return b"ok", b""
+
+
 @pytest.mark.asyncio
 async def test_echo(tool: BashTool) -> None:
     result = await tool.execute(command="echo hello")
@@ -48,6 +57,34 @@ async def test_timeout(tool: BashTool) -> None:
     result = await tool.execute(command="sleep 10", timeout=1)
     assert not result.success
     assert "超时" in (result.error or "")
+
+
+@pytest.mark.asyncio
+async def test_nano_banana_timeout_floor_is_300(
+    tool: BashTool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, float] = {}
+
+    async def fake_spawn_process(
+        command: str,
+        *,
+        env: dict[str, str],  # noqa: ARG001
+    ) -> _FakeProc:
+        assert "test_nano_banana_2.py" in command
+        return _FakeProc()
+
+    async def fake_wait_for(awaitable, timeout):  # type: ignore[no-untyped-def]
+        captured["timeout"] = timeout
+        return await awaitable
+
+    monkeypatch.setattr(BashTool, "_spawn_process", staticmethod(fake_spawn_process))
+    monkeypatch.setattr(bash_mod.asyncio, "wait_for", fake_wait_for)
+
+    result = await tool.execute(command="/tmp/test_nano_banana_2.py --mode text", timeout=120)
+
+    assert result.success is True
+    assert captured["timeout"] == 300
 
 
 @pytest.mark.asyncio

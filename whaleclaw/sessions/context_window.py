@@ -94,7 +94,13 @@ def _compress_l1(msg: Message) -> Message:
         kept = [text[:240]]
 
     body = "\n".join(kept)
-    return Message(role=msg.role, content=f"[L1压缩] {body} ...")
+    # Preserve tool_call_id and tool_calls to keep Responses API pairing intact.
+    return Message(
+        role=msg.role,
+        content=f"[L1压缩] {body} ...",
+        tool_call_id=msg.tool_call_id,
+        tool_calls=msg.tool_calls,
+    )
 
 
 def _compress_l0(msg: Message) -> Message:
@@ -112,7 +118,13 @@ def _compress_l0(msg: Message) -> Message:
             break
 
     body = first if not hints else first + " | " + " ; ".join(hints)
-    return Message(role=msg.role, content=f"[L0压缩] {body} ...")
+    # Preserve tool_call_id and tool_calls to keep Responses API pairing intact.
+    return Message(
+        role=msg.role,
+        content=f"[L0压缩] {body} ...",
+        tool_call_id=msg.tool_call_id,
+        tool_calls=msg.tool_calls,
+    )
 
 
 def _build_summary_message(summaries: list[SummaryRow], budget: int) -> str:
@@ -163,7 +175,7 @@ def _build_compacted_range_message(
     body = _clip_tokens("\n".join(parts), budget)
     if not body:
         return None
-    return Message(role="assistant", content=f"[历史压缩摘要]\n{body}")
+    return Message(role="system", content=f"[历史压缩摘要]\n{body}")
 
 
 def _keep_recent_with_budget(  # pyright: ignore[reportUnusedFunction]
@@ -210,6 +222,63 @@ def _flatten_groups(groups: list[list[Message]]) -> list[Message]:
     for g in groups:
         out.extend(g)
     return out
+
+
+def _repair_tool_call_pairs(messages: list[Message]) -> list[Message]:
+    """Remove orphaned function_call / function_call_output items.
+
+    After physical truncation the flattened list may contain:
+    - An assistant message with tool_calls whose IDs have no matching tool result.
+    - A tool message whose tool_call_id has no matching assistant function_call.
+
+    Both cases cause Responses API 400 errors.  We do two passes:
+    1. Collect all call_ids that have BOTH sides present.
+    2. Rebuild the list, dropping any assistant tool_calls entry or tool message
+       whose call_id is not in the complete set.
+    """
+    # Gather call_ids emitted by assistant messages.
+    emitted: set[str] = set()
+    for m in messages:
+        if m.role == "assistant" and m.tool_calls:
+            for tc in m.tool_calls:
+                if tc.id:
+                    emitted.add(tc.id)
+
+    # Gather call_ids fulfilled by tool messages.
+    fulfilled: set[str] = set()
+    for m in messages:
+        if m.role == "tool" and m.tool_call_id:
+            fulfilled.add(m.tool_call_id)
+
+    complete = emitted & fulfilled  # only IDs that have both sides
+
+    result: list[Message] = []
+    for m in messages:
+        if m.role == "tool":
+            # Drop tool messages with no tool_call_id (unpairable) or orphaned ID.
+            if not m.tool_call_id or m.tool_call_id not in complete:
+                continue
+            result.append(m)
+        elif m.role == "assistant" and m.tool_calls:
+            # Filter out individual tool_calls whose results were dropped.
+            kept_tcs = [tc for tc in m.tool_calls if tc.id in complete]
+            if not kept_tcs and not m.content:
+                # Pure tool-call assistant message with all calls orphaned → drop.
+                continue
+            if len(kept_tcs) != len(m.tool_calls):
+                # Rebuild message with only the paired tool_calls.
+                result.append(Message(
+                    role=m.role,
+                    content=m.content,
+                    tool_calls=kept_tcs if kept_tcs else None,
+                    tool_call_id=m.tool_call_id,
+                    images=m.images,
+                ))
+            else:
+                result.append(m)
+        else:
+            result.append(m)
+    return result
 
 
 def _compress_group(group: list[Message], *, level: str) -> list[Message]:
@@ -335,4 +404,4 @@ class ContextWindow:
                 continue
             trimmed.pop(0)
 
-        return [*system, *trimmed]
+        return [*system, *_repair_tool_call_pairs(trimmed)]

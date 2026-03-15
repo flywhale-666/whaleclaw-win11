@@ -78,17 +78,17 @@ class PptEditTool(Tool):
             description=(
                 "修改现有 PPT（.pptx）：支持文本替换、标题更新、商务风格、背景色、备注、"
                 "插图（add_image 新增图片；replace_image 替换已有图片，保持原位置尺寸；"
-                "remove_image 删除图片）。换图/替换封面图请用 replace_image。"
+                "remove_image 删除图片）；add_slide 在末尾追加新页。换图/替换封面图请用 replace_image。"
             ),
             parameters=[
                 ToolParameter(name="path", type="string", description="PPT 文件绝对路径"),
-                ToolParameter(name="slide_index", type="integer", description="页码（从 1 开始）"),
+                ToolParameter(name="slide_index", type="integer", description="页码（从 1 开始，add_slide 时可省略）"),
                 ToolParameter(
                     name="action",
                     type="string",
                     description=(
                         "操作类型：replace_text|set_title|set_notes|set_background"
-                        "|add_image|replace_image|remove_image|apply_business_style"
+                        "|add_image|replace_image|remove_image|apply_business_style|add_slide"
                     ),
                     required=False,
                     enum=[
@@ -100,6 +100,7 @@ class PptEditTool(Tool):
                         "replace_image",
                         "remove_image",
                         "apply_business_style",
+                        "add_slide",
                     ],
                 ),
                 ToolParameter(
@@ -188,7 +189,7 @@ class PptEditTool(Tool):
 
         if not raw_path:
             return ToolResult(success=False, output="", error="path 不能为空")
-        if slide_index <= 0:
+        if slide_index <= 0 and action != "add_slide":
             return ToolResult(success=False, output="", error="slide_index 必须 >= 1")
 
         path = Path(raw_path).expanduser().resolve()
@@ -201,6 +202,35 @@ class PptEditTool(Tool):
             prs = Presentation(str(path))
         except Exception as exc:
             return ToolResult(success=False, output="", error=f"PPT 打开失败: {exc}")
+
+        # add_slide 不需要预先校验 slide_index 是否越界
+        if action == "add_slide":
+            from pptx.util import Inches, Pt  # noqa: F811
+
+            title_text = str(kwargs.get("new_text", "")).strip()
+            # 使用空白布局（index 6 为空白，若不足则取 index 1）
+            layout_count = len(prs.slide_layouts)
+            layout_idx = min(6, layout_count - 1)
+            layout = prs.slide_layouts[layout_idx]
+            new_slide = prs.slides.add_slide(layout)
+            if title_text:
+                if new_slide.shapes.title is not None:
+                    new_slide.shapes.title.text = title_text
+                else:
+                    txBox = new_slide.shapes.add_textbox(
+                        Inches(0.8), Inches(0.35), Inches(11.0), Inches(1.0)
+                    )
+                    tf = txBox.text_frame
+                    tf.text = title_text
+                    for run in tf.paragraphs[0].runs:
+                        run.font.bold = True
+                        run.font.size = Pt(32)
+            new_index = len(prs.slides)
+            try:
+                prs.save(str(path))
+            except Exception as exc:
+                return ToolResult(success=False, output="", error=f"PPT 保存失败: {exc}")
+            return ToolResult(success=True, output=f"已在 {path} 末尾追加新页，当前共 {new_index} 页")
 
         if slide_index > len(prs.slides):
             return ToolResult(

@@ -24,17 +24,27 @@ class ReminderTool(Tool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="reminder",
-            description="Set a reminder to notify after N minutes.",
+            description="Set a reminder or schedule an agent task after N minutes.",
             parameters=[
                 ToolParameter(
                     name="message",
                     type="string",
-                    description="Reminder message.",
+                    description="Reminder message or agent task instruction.",
                 ),
                 ToolParameter(
                     name="minutes",
                     type="integer",
                     description="Minutes from now to trigger.",
+                ),
+                ToolParameter(
+                    name="action",
+                    type="string",
+                    description=(
+                        "Action type: 'message' (default) sends a reminder notification; "
+                        "'agent_task' runs the message as an agent instruction after the delay."
+                    ),
+                    required=False,
+                    enum=["message", "agent_task"],
                 ),
             ],
         )
@@ -60,23 +70,28 @@ class ReminderTool(Tool):
         if minutes < 1:
             return ToolResult(success=False, output="", error="minutes 必须大于 0")
 
+        raw_action = str(kwargs.get("action", "message")).strip().lower()
+        action_type: str = "agent" if raw_action == "agent_task" else "message"
+
         now = datetime.now()
         target = now + timedelta(minutes=minutes)
+        payload: dict[str, object] = {"text": message}
         job = CronJob(
             id=f"reminder-{uuid4().hex[:12]}",
             name=f"提醒: {message[:20]}",
             schedule_obj=Schedule(kind="at", at=target),
             action=CronAction(
-                type="message",
+                type=action_type,  # type: ignore[arg-type]
                 target=self.current_session_id or "user",
-                payload={"text": message},
+                payload=payload,
             ),
             enabled=True,
             created_at=now,
             one_shot=True,
         )
         await self._scheduler.add_job(job)
+        label = "定时 agent 任务" if action_type == "agent" else "提醒"
         return ToolResult(
             success=True,
-            output=f"提醒已设置，{minutes} 分钟后通知",
+            output=f"{label}已设置，{minutes} 分钟后执行",
         )

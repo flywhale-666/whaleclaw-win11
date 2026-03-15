@@ -1,7 +1,7 @@
 """PromptAssembler — layered system prompt builder with token budgeting.
 
 Architecture:
-- Static layer (~150 tokens): core identity, always injected
+- Static layer (~200 tokens): core identity + AI constitution + safety boundaries, always injected
 - Dynamic layer (0~800 tokens): skills routed by user message keywords
 - Fallback layer: tool descriptions for providers without native tools API
 
@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import sys
 from enum import StrEnum
+from pathlib import Path
 
 from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.providers.base import CacheControl, Message
+from whaleclaw.security.constitution import CONSTITUTION_TEXT
 from whaleclaw.skills.manager import SkillManager
 from whaleclaw.skills.parser import Skill
 
@@ -31,6 +33,24 @@ class PromptLayer(StrEnum):
 
 _DEFAULT_ASSISTANT_NAME = "WhaleClaw"
 
+
+def _detect_project_python() -> str:
+    """Return the absolute path of the project-embedded Python interpreter."""
+    project_root = Path(__file__).resolve().parents[2]
+    candidates = (
+        project_root / "python" / "python.exe",
+        project_root / "python" / "bin" / "python3.12",
+        project_root / "python" / "bin" / "python3",
+    )
+    for p in candidates:
+        if p.is_file():
+            return str(p)
+    # Fallback: keep a platform-appropriate relative hint so the prompt is
+    # still sensible even if the embedded interpreter isn't found.
+    if sys.platform == "win32":
+        return str(project_root / "python" / "python.exe")
+    return str(project_root / "python" / "bin" / "python3.12")
+
 _PLATFORM_HINT_WINDOWS = """\
 - 当前运行环境是 **Windows**，bash 工具底层使用 **PowerShell 5.1** 执行命令
 - 使用 PowerShell 兼容语法，不要用 bash-only 语法（如 ||、/dev/null、which、find -name 等）
@@ -38,6 +58,9 @@ _PLATFORM_HINT_WINDOWS = """\
 - 路径分隔符用反斜杠 \\，抑制错误用 2>$null 而非 2>/dev/null"""
 
 _PLATFORM_HINT_UNIX = ""
+
+_WORKSPACE_SAFETY_RULES = """\
+【需确认才执行】发邮件/消息/公开帖子等对外通信；删除工作空间以外的系统文件；涉及金钱或账号权限变更。多步骤任务（>3步）开始前写执行计划到 ~/.whaleclaw/workspace/task-plan.md，完成后清理。"""
 
 _STATIC_PROMPT_TEMPLATE = """\
 你是 {assistant_name}，一个运行在用户本地电脑上的 AI 助手。
@@ -50,7 +73,7 @@ _STATIC_PROMPT_TEMPLATE = """\
 - 下载或生成的图片用 markdown 显示：![描述](文件绝对路径)
 - 生成的其他文件告诉用户绝对路径
 - **严禁编造文件路径**：只使用工具返回的真实路径，绝不自己猜测或虚构文件名
-- 运行 Python 脚本时优先使用项目内嵌 Python（Windows: ./python/python.exe；mac/Linux: ./python/bin/python3.12）
+- 运行 Python 脚本时优先使用项目内嵌 Python（绝对路径：{python_cmd}）
   （不要用 python -c 或 python3 -c，脚本长度会被截断）
 - 需要生成文件（PPT/Excel/PDF等）时：先用 file_write 写 .py 脚本到本机临时工作目录（优先 ~/.whaleclaw/workspace/tmp），再用 bash 执行
 - 修改已有 Office 文件时先判断复杂度：纯文本改动优先局部编辑（ppt_edit/docx_edit/xlsx_edit）；
@@ -62,7 +85,11 @@ _STATIC_PROMPT_TEMPLATE = """\
   不要绕过技能直接用通用 bash/python 方案
 - **禁止自我否定已完成的工作**：如果你之前已经成功调用工具生成了文件，
   不要说"我之前没有真正执行"或"我一直在空谈"。工具调用成功就是成功，直接告诉用户文件路径即可
-- 用户说"改一下"时，只修改用户指出的问题，不要推翻重做整个任务"""
+- 用户说"改一下"时，只修改用户指出的问题，不要推翻重做整个任务
+
+{workspace_safety}
+
+{constitution}"""
 
 _TOOL_FALLBACK_HEADER = """\
 【工具调用规则 - 必须严格遵守】
@@ -150,14 +177,18 @@ class PromptAssembler:
         return messages
 
     def _build_static(self, config: WhaleclawConfig, assistant_name: str) -> str:
-        """Static layer — core identity (~150 tokens), cacheable."""
+        """Static layer — core identity + safety boundaries (~250 tokens), cacheable."""
         safe_name = assistant_name.strip() or _DEFAULT_ASSISTANT_NAME
         platform_hint = (
             _PLATFORM_HINT_WINDOWS if sys.platform == "win32" else _PLATFORM_HINT_UNIX
         )
+        python_cmd = _detect_project_python()
         return _STATIC_PROMPT_TEMPLATE.format(
             assistant_name=safe_name,
             platform_hint=platform_hint,
+            workspace_safety=_WORKSPACE_SAFETY_RULES,
+            constitution=CONSTITUTION_TEXT,
+            python_cmd=python_cmd,
         )
 
     def _build_dynamic(

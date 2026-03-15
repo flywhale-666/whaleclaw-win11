@@ -11,6 +11,7 @@ from whaleclaw.providers.minimax import MiniMaxProvider
 from whaleclaw.providers.moonshot import MoonshotProvider
 from whaleclaw.providers.nvidia import NvidiaProvider
 from whaleclaw.providers.openai import OpenAIProvider
+from whaleclaw.providers.openai_compat import OpenAICompatProvider
 from whaleclaw.providers.qwen import QwenProvider
 from whaleclaw.providers.zhipu import ZhipuProvider
 from whaleclaw.types import ProviderError, StreamCallback
@@ -32,7 +33,15 @@ _PROVIDER_MAP: dict[str, type[LLMProvider]] = {
 
 
 def _get_provider_config(models_cfg: ModelsConfig, name: str) -> ProviderConfig:
-    return getattr(models_cfg, name, ProviderConfig())
+    known = getattr(models_cfg, name, None)
+    if known is not None and isinstance(known, ProviderConfig):
+        return known
+    # Custom providers land in model_extra (requires ModelsConfig extra="allow")
+    extra = models_cfg.model_extra or {}
+    raw = extra.get(name)
+    if isinstance(raw, dict):
+        return ProviderConfig.model_validate(raw)
+    return ProviderConfig()
 
 
 class ModelRouter:
@@ -53,13 +62,26 @@ class ModelRouter:
         else:
             provider_name, model_name = "anthropic", model_id
 
-        if provider_name not in _PROVIDER_MAP:
-            raise ProviderError(f"不支持的模型提供商: {provider_name}")
-
         if provider_name in self._cache:
             return self._cache[provider_name], model_name
 
         cfg = _get_provider_config(self._models_config, provider_name)
+
+        if provider_name not in _PROVIDER_MAP:
+            # 未知 provider 回退到通用 OpenAI 兼容模式（自定义提供商）
+            if not cfg.api_key:
+                raise ProviderError(f"不支持的模型提供商: {provider_name}，或未配置 API Key")
+            try:
+                instance: LLMProvider = OpenAICompatProvider(
+                    api_key=cfg.api_key,
+                    base_url=cfg.base_url,
+                    timeout=cfg.timeout,
+                )
+            except Exception as exc:
+                raise ProviderError(f"{provider_name} 初始化失败: {exc}") from exc
+            self._cache[provider_name] = instance
+            return instance, model_name
+
         cls = _PROVIDER_MAP[provider_name]
 
         kwargs: dict[str, object] = {"timeout": cfg.timeout}

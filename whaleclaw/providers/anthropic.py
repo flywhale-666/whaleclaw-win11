@@ -14,6 +14,7 @@ from whaleclaw.providers.base import (
     Message,
     ToolCall,
     ToolSchema,
+    repair_tool_call_pairs,
 )
 from whaleclaw.types import ProviderAuthError, ProviderError, ProviderRateLimitError, StreamCallback
 from whaleclaw.utils.log import get_logger
@@ -46,7 +47,7 @@ class AnthropicProvider(LLMProvider):
         system_parts: list[dict[str, Any]] = []
         conversation: list[dict[str, Any]] = []
 
-        for msg in messages:
+        for msg in repair_tool_call_pairs(messages):
             if msg.role == "system":
                 block: dict[str, Any] = {"type": "text", "text": msg.content}
                 if msg.cache_control:

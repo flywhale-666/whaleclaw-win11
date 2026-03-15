@@ -161,7 +161,11 @@ class McpClient:
     async def _call_http(self, request: dict[str, Any]) -> Any:
         assert self._http is not None  # noqa: S101
         try:
-            resp = await self._http.post(self._cfg.url, json=request)
+            resp = await self._http.post(
+                self._cfg.url,
+                json=request,
+                headers={"Accept": "application/json, text/event-stream"},
+            )
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             raise McpError(

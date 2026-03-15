@@ -18,6 +18,7 @@ from whaleclaw.providers.base import (
     Message,
     ToolCall,
     ToolSchema,
+    repair_tool_call_pairs,
 )
 from whaleclaw.types import ProviderAuthError, ProviderError, ProviderRateLimitError, StreamCallback
 from whaleclaw.utils.log import get_logger
@@ -52,7 +53,7 @@ class GoogleProvider(LLMProvider):
         system_text = ""
         contents: list[dict[str, Any]] = []
 
-        for msg in messages:
+        for msg in repair_tool_call_pairs(messages):
             if msg.role == "system":
                 system_text += msg.content + "\n"
             elif msg.role == "assistant" and msg.tool_calls:

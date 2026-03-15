@@ -314,6 +314,35 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     cron_store = CronStore(_CRON_DB_PATH)
 
     async def _on_cron_fire(job_id: str, action: CronAction) -> None:
+        if action.type == "agent":
+            # 以定时 agent 任务方式执行：直接调用 run_agent
+            session_id = action.target
+            task_text = action.payload.get("text", "")
+            if not (session_id and task_text):
+                return
+            mgr = state.get("manager")
+            cfg_ref = state.get("config")
+            router_ref = state.get("router")
+            if not isinstance(mgr, SessionManager) or cfg_ref is None or router_ref is None:
+                return
+            from whaleclaw.agent.single_agent import run_agent as _run_agent
+
+            try:
+                s = await mgr.get(session_id)
+                reply = await _run_agent(
+                    str(task_text),
+                    session_id,
+                    cfg_ref,  # type: ignore[arg-type]
+                    session=s,
+                    router=router_ref,  # type: ignore[arg-type]
+                    session_manager=mgr,
+                )
+                await push_to_session(session_id, make_message(session_id, reply))
+            except Exception as _exc:
+                import structlog as _slog
+                _slog.get_logger().warning("cron.agent_task_failed", job_id=job_id, error=str(_exc))
+            return
+
         if action.type == "message":
             session_id = action.target
             text = action.payload.get("text", "")

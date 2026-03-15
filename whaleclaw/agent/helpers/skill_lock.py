@@ -106,19 +106,7 @@ _CLEAN_SKILL_ACTIVATION_KEYWORDS: tuple[str, ...] = (
     "切换到",
 )
 _CLEAN_SKILL_NOUNS: tuple[str, ...] = ("技能", "skill")
-_CLEAN_SKILL_SWITCH_CONSENT_KEYWORDS: tuple[str, ...] = (
-    "同意切换技能",
-    "可以切换技能",
-    "确认切换技能",
-    "允许切换技能",
-)
 _CLEAN_TASK_DONE_PHRASES: tuple[str, ...] = ("任务完成", "完成任务", "任务结束", "结束任务")
-_CLEAN_TASK_DONE_INTENT_PHRASES: tuple[str, ...] = (
-    "本轮结束",
-    "这轮结束",
-    "收尾",
-    "结束当前任务",
-)
 
 
 def parse_use_command(
@@ -164,8 +152,7 @@ def build_skill_lock_system_message(skill_ids: list[str]) -> Message:
         content=(
             f"当前会话已锁定技能：{joined}。\n"
             "执行时仅允许在这些技能范围内规划与调用，不要偏移到无关方案。\n"
-            "若需切换到其它技能，必须先征得用户明确同意。\n"
-            "若用户明确回复“任务完成”，再解除该锁定。"
+            "若用户明确回复\u201c任务完成\u201d或\u201c完成任务\u201d，再解除该锁定。"
         ),
     )
 
@@ -173,27 +160,34 @@ def build_skill_lock_system_message(skill_ids: list[str]) -> Message:
 def build_nano_banana_execution_system_message(
     current_model: str,
     recent_image_paths: list[str],
+    recommended_command: str = "",
 ) -> Message:
     image_lines = (
         "\n".join(f"- {path}" for path in recent_image_paths)
         if recent_image_paths
         else "- 当前没有可复用的历史图片路径"
     )
-    return Message(
-        role="system",
-        content=(
-            "当前正在执行 nano-banana-image-t8 技能。\n"
-            "执行约束：\n"
-            f"1) 当前本轮模型是：{current_model}。若调用脚本，"
-            f"必须把 `--model` 和 `--edit-model` 都设置为 `{current_model}`，"
-            "不要继续沿用其它模型。\n"
-            "2) 对外回复只使用展示名“香蕉2”或“香蕉pro”，除非用户明确追问，不要暴露底层模型标识。\n"
-            "3) 若用户是在说“重试”“继续处理这张图”“改用香蕉pro重试”这类续跑语义，且没有上传新图，"
-            "默认复用最近一轮可用图片，不要再要求用户重新上传。\n"
-            "4) 当前可直接复用的历史图片绝对路径如下：\n"
-            f"{image_lines}"
-        ),
+    cmd_hint = (
+        "\n5) 推荐直接使用以下命令执行（已按本轮参数预填好），不需要再做任何探测或试错：\n"
+        f"```\n{recommended_command}\n```"
+        if recommended_command.strip()
+        else ""
     )
+    body = (
+        "当前正在执行 nano-banana-image-t8 技能。\n"
+        "执行约束：\n"
+        f"1) 当前本轮模型是：{current_model}。若调用脚本，"
+        f"必须把 `--model` 和 `--edit-model` 都设置为 `{current_model}`，"
+        "不要继续沿用其它模型。\n"
+        '2) 对外回复只使用展示名\u201c香蕉2\u201d或\u201c香蕉pro\u201d，除非用户明确追问，不要暴露底层模型标识。\n'
+        '3) 若用户是在说\u201c重试\u201d\u201c继续处理这张图\u201d\u201c改用香蕉pro重试\u201d这类续跑语义，且没有上传新图，'
+        "默认复用最近一轮可用图片，不要再要求用户重新上传。\n"
+        f"4) 当前可直接复用的历史图片绝对路径如下：\n{image_lines}\n"
+        "5) 禁止使用 bash 做环境探测或计划回读，例如 `Test-Path`、`Get-Content`、"
+        "`ls/stat/test`、读取 `task-plan.md` 等；需要生图时直接执行推荐命令。"
+        f"{cmd_hint}"
+    )
+    return Message(role="system", content=body)
 
 
 def looks_like_skill_activation_message(
@@ -216,23 +210,6 @@ def looks_like_skill_activation_message(
     return any(pattern.search(stripped) for pattern in skill_activation_patterns)
 
 
-def is_skill_switch_consent(
-    text: str,
-    *,
-    skill_switch_consent_patterns: tuple[re.Pattern[str], ...],
-) -> bool:
-    stripped = text.strip()
-    if not stripped:
-        return False
-    normalized = _normalized_compact(stripped)
-    if any(keyword in stripped for keyword in _CLEAN_SKILL_SWITCH_CONSENT_KEYWORDS):
-        return True
-    if "切换技能" in stripped and any(
-        token in normalized for token in ("同意", "可以", "确认", "允许")
-    ):
-        return True
-    return any(pattern.search(stripped) for pattern in skill_switch_consent_patterns)
-
 
 def normalize_skill_ids(skills: list[Skill]) -> list[str]:
     seen: set[str] = set()
@@ -248,10 +225,8 @@ def normalize_skill_ids(skills: list[Skill]) -> list[str]:
 
 def skill_announcement(skill_ids: list[str], previous_skill_ids: list[str]) -> str:
     joined = "、".join(skill_ids)
-    if not previous_skill_ids:
+    if not previous_skill_ids or previous_skill_ids != skill_ids:
         return f"我将使用 {joined} 技能继续完成任务。"
-    if previous_skill_ids != skill_ids:
-        return f"已按你的要求切换为 {joined} 技能，我继续处理。"
     return f"我会继续使用 {joined} 技能推进当前任务。"
 
 
@@ -498,13 +473,17 @@ _NANO_BANANA_CONTROL_PREFIXES: tuple[str, ...] = (
 
 
 def is_nano_banana_control_message(text: str) -> bool:
-    """Return whether the message is only a Nano Banana control/activation command."""
+    """Return whether the message is only a Nano Banana control/activation command.
+
+    Only short, standalone control phrases match (e.g. "切换香蕉pro", "香蕉2重试").
+    Task messages containing "香蕉生图" as part of a generation request (e.g.
+    "使用香蕉生图画一张狗熊偷吃蜂蜜的图") intentionally do NOT match, so that
+    control_message_only=False and the agent executes the task normally.
+    """
     stripped = text.strip()
     if not stripped:
         return False
     normalized = _normalized_compact(stripped)
-    if any(token in normalized for token in _NANO_BANANA_ACTIVATION_TOKENS):
-        return True
     if any(prefix in normalized for prefix in _NANO_BANANA_CONTROL_PREFIXES) and any(
         token in normalized for token in ("香蕉2", "香蕉pro")
     ):
@@ -513,13 +492,15 @@ def is_nano_banana_control_message(text: str) -> bool:
 
 
 def is_nano_banana_activation_message(text: str) -> bool:
-    """Return whether the message is a pure Nano Banana activation command."""
+    """Return whether the message is a pure Nano Banana activation command.
+
+    Only short, standalone activation phrases match (e.g. "使用香蕉生图").
+    Messages that contain actual task content (e.g. "使用香蕉生图画两张老虎下山图")
+    intentionally do NOT match, so the agent loop can execute the task normally.
+    """
     stripped = text.strip()
     if not stripped:
         return False
-    normalized = _normalized_compact(stripped)
-    if any(token in normalized for token in _NANO_BANANA_ACTIVATION_TOKENS):
-        return True
     return any(pattern.fullmatch(stripped) for pattern in _NANO_BANANA_ACTIVATION_MESSAGE_PATTERNS)
 
 
@@ -595,10 +576,8 @@ def _build_nano_banana_param_guard_reply(state: dict[str, object]) -> str:
         missing_prompts.append("请提供 Nano Banana API Key")
     if not param_satisfied(SkillParamItem(key="prompt", type="text"), prompt_value):
         missing_prompts.append("请提供提示词")
-    raw_images = state.get("images")
-    image_count = int(raw_images) if isinstance(raw_images, int) else 0
-    if image_count < 1:
-        missing_prompts.append("请上传图片")
+    # Images are optional (required=False); only required for image-to-image which is
+    # determined at execution time, not at the param-guard stage.
     if missing_prompts:
         lines.append("请补充：" + "；".join(missing_prompts) + "。")
     else:
@@ -752,7 +731,6 @@ __all__ = [
     "has_param_secret_source",
     "is_nano_banana_activation_message",
     "is_nano_banana_control_message",
-    "is_skill_switch_consent",
     "is_task_done_confirmation",
     "looks_like_skill_activation_message",
     "nano_banana_missing_required",

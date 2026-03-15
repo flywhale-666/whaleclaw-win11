@@ -85,6 +85,17 @@ def normalize_bash_command_signature(command: str) -> str:
     return re.sub(r"\s+", " ", command.strip())
 
 
+_NANO_BANANA_BASH_RE = re.compile(
+    r"test_nano_banana",
+    re.IGNORECASE,
+)
+
+
+def is_nano_banana_bash_command(command: str) -> bool:
+    """Return True if the bash command is a nano-banana image generation command."""
+    return bool(_NANO_BANANA_BASH_RE.search(command))
+
+
 _BASH_NOISE_RE = re.compile(
     r"\s*2>\s*\$null\b|"           # 2>$null
     r"\s*2>/dev/null\b|"           # 2>/dev/null
@@ -253,10 +264,29 @@ def apply_tool_result_guards(
             state.same_failed_bash_streak = 0
             state.last_failed_bash_signature = ""
         else:
+            raw_command = str(tc.arguments.get("command", ""))
+            # nano-banana 生图命令失败：任何原因一律禁止重试，继续执行剩余任务
+            if is_nano_banana_bash_command(raw_command):
+                update.log_events.append(
+                    GuardLogEvent(
+                        level="warning",
+                        event="agent.nano_banana_image_gen_failed",
+                        fields={
+                            "session_id": session_id or "",
+                            "error": (result.error or "")[:200],
+                        },
+                    )
+                )
+                update.conversation_messages.append(
+                    "[系统提示] 本次生图失败，禁止自动重试。"
+                    "请继续执行剩余的生图任务（如用户要求生成多张图，跳过本张继续生成后续图片）。"
+                    "所有任务完成后，将成功和失败的结果一并回复用户，由用户决定是否对失败的图重新操作。"
+                )
+                # nano-banana 失败不计入通用 bash 失败熔断计数
+                return update
+
             state.bash_fail_streak += 1
-            failed_sig = normalize_bash_command_signature(
-                str(tc.arguments.get("command", ""))
-            )
+            failed_sig = normalize_bash_command_signature(raw_command)
             if failed_sig and failed_sig == state.last_failed_bash_signature:
                 state.same_failed_bash_streak += 1
             elif failed_sig:
@@ -484,6 +514,7 @@ __all__ = [
     "apply_tool_result_guards",
     "blocked_tool_reasons",
     "is_low_value_bash_probe",
+    "is_nano_banana_bash_command",
     "is_progress_stage_tool_call",
     "normalize_bash_command_signature",
     "tail_repeat_count",

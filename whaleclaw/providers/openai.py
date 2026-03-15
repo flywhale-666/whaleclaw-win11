@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from whaleclaw.providers.base import AgentResponse, Message, ToolCall, ToolSchema
+from whaleclaw.providers.base import AgentResponse, Message, ToolCall, ToolSchema, repair_tool_call_pairs
 from whaleclaw.providers.openai_compat import OpenAICompatProvider
 from whaleclaw.types import ProviderAuthError, ProviderError, ProviderRateLimitError, StreamCallback
 from whaleclaw.utils.log import get_logger
@@ -149,6 +149,34 @@ class OpenAIProvider(OpenAICompatProvider):
                 })
         return items
 
+    @staticmethod
+    def _repair_responses_input(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Last-resort dict-level guard after _build_responses_input conversion.
+
+        repair_tool_call_pairs() already handles the Message level.  This pass
+        covers any edge-case where the dict conversion itself creates orphans
+        (e.g. a tool_call with an empty name that was skipped during emit but
+        whose output is still present).
+        """
+        emitted: set[str] = {
+            item["call_id"]
+            for item in items
+            if item.get("type") == "function_call" and item.get("call_id")
+        }
+        fulfilled: set[str] = {
+            item["call_id"]
+            for item in items
+            if item.get("type") == "function_call_output" and item.get("call_id")
+        }
+        complete = emitted & fulfilled
+        return [
+            item for item in items
+            if not (
+                (item.get("type") == "function_call" and item.get("call_id") not in complete)
+                or (item.get("type") == "function_call_output" and item.get("call_id") not in complete)
+            )
+        ]
+
     def _build_responses_body(
         self,
         messages: list[Message],
@@ -156,9 +184,12 @@ class OpenAIProvider(OpenAICompatProvider):
         tools: list[ToolSchema] | None,
     ) -> dict[str, Any]:
         include_system = self._auth_mode != "oauth"
+        # Message-level repair first, then dict-level safety net.
+        clean_messages = repair_tool_call_pairs(messages)
+        raw_input = self._build_responses_input(clean_messages, include_system=include_system)
         body: dict[str, Any] = {
             "model": model,
-            "input": self._build_responses_input(messages, include_system=include_system),
+            "input": self._repair_responses_input(raw_input),
             "stream": True,
         }
         if tools:

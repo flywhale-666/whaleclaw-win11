@@ -728,6 +728,69 @@ async def test_run_agent_circuit_breaker_blocks_repeated_browser_failures() -> N
 
 
 @pytest.mark.asyncio
+async def test_run_agent_keeps_tool_result_adjacent_to_native_tool_call() -> None:
+    browser_tool_response = AgentResponse(
+        content="",
+        model="test-model",
+        tool_calls=[
+            ToolCall(
+                id="tc_browser",
+                name="browser",
+                arguments={"action": "search_images", "text": "杨幂近照"},
+            )
+        ],
+    )
+    final_response = AgentResponse(
+        content="改用 bash 处理",
+        model="test-model",
+    )
+
+    call_count = 0
+    third_call_messages: list[Message] = []
+
+    async def fake_chat(
+        model_id: str,  # noqa: ARG001
+        messages: list[Any],
+        *,
+        tools: Any = None,  # noqa: ARG001
+        on_stream: Any = None,  # noqa: ARG001
+    ) -> AgentResponse:
+        nonlocal call_count, third_call_messages
+        call_count += 1
+        if call_count == 3:
+            third_call_messages = cast(list[Message], messages)
+            return final_response
+        return browser_tool_response
+
+    router = _make_router(chat_fn=fake_chat)
+    registry = ToolRegistry()
+    registry.register(_BrowserAlwaysFailTool())
+
+    result = await run_agent(
+        message="给我张杨幂近照",
+        session_id="test-browser-tool-order",
+        config=WhaleclawConfig(),
+        router=router,
+        registry=registry,
+    )
+
+    assert result == "改用 bash 处理"
+    assert call_count == 3
+    assert third_call_messages
+    assistant_idx = max(
+        idx
+        for idx, msg in enumerate(third_call_messages)
+        if msg.role == "assistant" and msg.tool_calls
+    )
+    assert third_call_messages[assistant_idx + 1].role == "tool"
+    assert third_call_messages[assistant_idx + 1].tool_call_id == "tc_browser"
+    assert any(
+        msg.role == "user" and "browser 工具连续失败，已自动熔断" in msg.content
+        for msg in third_call_messages[assistant_idx + 2:]
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_agent_circuit_breaker_blocks_repeated_bash_failures() -> None:
     bash_tool_response = AgentResponse(
         content="",

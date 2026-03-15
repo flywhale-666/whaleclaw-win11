@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
+import shlex
+import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -27,7 +30,23 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-_PROJECT_PYTHON = Path(__file__).resolve().parents[3] / "python" / "bin" / "python3.12"
+
+def _detect_project_python() -> Path:
+    project_root = Path(__file__).resolve().parents[3]
+    candidates = (
+        project_root / "python" / "python.exe",
+        project_root / "python" / "bin" / "python3.12",
+        project_root / "python" / "bin" / "python3",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    if sys.platform == "win32":
+        return project_root / "python" / "python.exe"
+    return project_root / "python" / "bin" / "python3.12"
+
+
+_PROJECT_PYTHON = _detect_project_python()
 _DIRECT_PY_SCRIPT_RE = re.compile(
     r"^"
     r"(?P<prefix>(?:[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|[^\s]+)\s+)*)"
@@ -38,6 +57,18 @@ _PY_SHELL_MISMATCH_HINTS = (
     "from: command not found",
     "import: command not found",
 )
+_NANO_BANANA_SCRIPT_RE = re.compile(r"test_nano_banana_2\.py", re.IGNORECASE)
+_NANO_BANANA_ARGPARSE_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"usage:\s+test_nano_banana_2\.py\b", re.IGNORECASE),
+    re.compile(r"error:\s+invalid choice\b", re.IGNORECASE),
+    re.compile(r"error:\s+unrecognized arguments\b", re.IGNORECASE),
+    re.compile(r"error:\s+the following arguments are required\b", re.IGNORECASE),
+    re.compile(r"error:\s+argument\s+--[a-z0-9][a-z0-9_-]*\b", re.IGNORECASE),
+)
+_RATIO_VALUE_RE = re.compile(r"^\d+:\d+$")
+_NANO_BANANA_SPLIT_RE = re.compile(r"\s*(?:&&|;|\r?\n)+\s*")
+_NANO_BANANA_BATCH_SIZE = 5
+_NANO_BANANA_BATCH_DELAY_SECONDS = 1.5
 
 
 def create_default_registry(
@@ -138,7 +169,7 @@ def parse_fallback_tool_calls(text: str) -> list[ToolCall]:
                 ToolCall(
                     id=f"fallback_{len(calls)}",
                     name=raw_name,
-                    arguments=raw_args,
+                    arguments=cast(dict[str, object], raw_args),
                 )
             )
 
@@ -164,6 +195,7 @@ async def persist_message(
     *,
     tool_call_id: str | None = None,
     tool_name: str | None = None,
+    tool_calls: list[object] | None = None,
 ) -> None:
     try:
         await manager.add_message(
@@ -172,6 +204,7 @@ async def persist_message(
             content,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            tool_calls=tool_calls,  # type: ignore[arg-type]
         )
     except Exception as exc:
         log.debug("agent.persist_failed", error=str(exc))
@@ -190,6 +223,8 @@ async def execute_tool(
     on_tool_call: OnToolCall | None,
     on_tool_result: OnToolResult | None,
 ) -> tuple[str, ToolResult]:
+    if tc.name == "bash":
+        tc = _normalize_nano_banana_bash_tool_call(tc)
     if on_tool_call:
         await on_tool_call(tc.name, tc.arguments)
 
@@ -263,9 +298,125 @@ async def _execute_registered_tool(registry: ToolRegistry, tc: ToolCall) -> Tool
     if tool is None:
         return ToolResult(success=False, output="", error=f"未知工具: {tc.name}")
     try:
+        if tc.name == "bash":
+            parallel_result = await _execute_parallel_nano_bash_commands(tool, tc)
+            if parallel_result is not None:
+                return parallel_result
         return await tool.execute(**tc.arguments)
     except Exception as exc:
         return ToolResult(success=False, output="", error=str(exc))
+
+
+def _split_parallel_nano_bash_commands(command: str) -> list[str]:
+    if not _NANO_BANANA_SCRIPT_RE.search(command):
+        return []
+    parts = [part.strip() for part in _NANO_BANANA_SPLIT_RE.split(command) if part.strip()]
+    if len(parts) <= 1:
+        return []
+    if not all(_NANO_BANANA_SCRIPT_RE.search(part) for part in parts):
+        return []
+    return parts
+
+
+async def _execute_parallel_nano_bash_commands(tool: object, tc: ToolCall) -> ToolResult | None:
+    raw_command = str(tc.arguments.get("command", "")).strip()
+    if not raw_command or bool(tc.arguments.get("background", False)):
+        return None
+    commands = _split_parallel_nano_bash_commands(raw_command)
+    if not commands:
+        return None
+    if not hasattr(tool, "execute"):
+        return None
+
+    timeout = int(tc.arguments.get("timeout", 30))
+    results: list[ToolResult] = []
+    for start in range(0, len(commands), _NANO_BANANA_BATCH_SIZE):
+        if start > 0:
+            await asyncio.sleep(_NANO_BANANA_BATCH_DELAY_SECONDS)
+        batch = commands[start : start + _NANO_BANANA_BATCH_SIZE]
+        batch_results = await asyncio.gather(*(
+            tool.execute(command=command, timeout=timeout, background=False)  # type: ignore[attr-defined]
+            for command in batch
+        ))
+        results.extend(batch_results)
+
+    success = all(result.success for result in results)
+    blocks: list[str] = []
+    errors: list[str] = []
+    for idx, result in enumerate(results, start=1):
+        detail = result.output.strip() or (result.error or "").strip() or "(empty output)"
+        blocks.append(f"[并发生图 {idx}]\n{detail}")
+        if not result.success:
+            errors.append(f"{idx}:{(result.error or detail)[:200]}")
+    return ToolResult(
+        success=success,
+        output="\n\n".join(blocks),
+        error=" | ".join(errors) if errors else None,
+    )
+
+
+def _normalize_nano_banana_bash_tool_call(tc: ToolCall) -> ToolCall:
+    if tc.name != "bash":
+        return tc
+    raw_command = str(tc.arguments.get("command", "")).strip()
+    if not raw_command or not _NANO_BANANA_SCRIPT_RE.search(raw_command):
+        return tc
+    normalized = _normalize_nano_banana_command(raw_command)
+    if normalized == raw_command:
+        return tc
+    updated_args = dict(tc.arguments)
+    updated_args["command"] = normalized
+    log.info(
+        "agent.nano_banana_command_autofixed",
+        original=raw_command[:240],
+        normalized=normalized[:240],
+    )
+    return ToolCall(id=tc.id, name=tc.name, arguments=updated_args)
+
+
+def _normalize_nano_banana_command(command: str) -> str:
+    try:
+        tokens = shlex.split(command, posix=True)
+    except ValueError:
+        return command
+    if not tokens or not any(_NANO_BANANA_SCRIPT_RE.search(token) for token in tokens):
+        return command
+
+    changed = False
+    normalized: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        next_token = tokens[idx + 1] if idx + 1 < len(tokens) else None
+
+        if token == "--api-base":
+            normalized.append("--base-url")
+            changed = True
+            idx += 1
+            continue
+
+        if token == "--mode" and next_token is not None:
+            if next_token == "text2image":
+                normalized.extend(["--mode", "text"])
+                changed = True
+                idx += 2
+                continue
+            normalized.extend([token, next_token])
+            idx += 2
+            continue
+
+        if token == "--size" and next_token is not None and _RATIO_VALUE_RE.match(next_token):
+            normalized.extend(["--aspect-ratio", next_token])
+            changed = True
+            idx += 2
+            continue
+
+        normalized.append(token)
+        idx += 1
+
+    if not changed:
+        return command
+    return shlex.join(normalized)
 
 
 async def _maybe_retry_after_mkdir(
@@ -337,10 +488,176 @@ async def _maybe_retry_python_script_invocation(
         return result
 
 
-def format_tool_output(result: ToolResult) -> str:
+def _summarize_error_output(error: str, output: str) -> str:
+    """从失败 tool 输出中提取关键信息，控制在 300 字符以内。
+
+    提取策略：
+    - 5 行以内：原样返回
+    - 含 Traceback：取 Traceback 前内容 + 最终错误行 + /tmp/ 用户帧
+    - 无 Traceback 的长输出：取首 3 行 + 尾 2 行，中间省略
+    """
+    full = f"{error}\n{output}".strip() if output.strip() else error.strip()
+    lines = full.splitlines()
+    if len(lines) <= 5:
+        return full if len(full) <= 300 else full[:297] + "..."
+
+    tb_idx = next(
+        (i for i, ln in enumerate(lines) if ln.strip().startswith("Traceback")),
+        -1,
+    )
+
+    parts: list[str] = []
+    if tb_idx >= 0:
+        pre = "\n".join(ln for ln in lines[:tb_idx] if ln.strip()).strip()
+        if pre:
+            parts.append(pre)
+        post_lines = [ln for ln in lines[tb_idx + 1 :] if ln.strip()]
+        if post_lines:
+            parts.append(post_lines[-1].strip())
+        user_frames = [
+            ln.strip()
+            for ln in lines
+            if "/tmp/" in ln and ln.strip().startswith("File ")
+        ]
+        if user_frames:
+            parts.append(user_frames[-1])
+    else:
+        head = "\n".join(lines[:3]).strip()
+        tail = "\n".join(lines[-2:]).strip()
+        parts.append(head)
+        if tail and tail != head:
+            parts.append("...(省略中间内容)...")
+            parts.append(tail)
+
+    summary = "\n".join(parts).strip()
+    if len(summary) > 300:
+        summary = summary[:297] + "..."
+    return summary or full[:300]
+
+
+_NOISE_SEPARATOR_RE = re.compile(r"^[\s\-=*#~+]{6,}$")
+_NOISE_ETA_RE = re.compile(r"eta\s+\d+:\d+:\d+", re.IGNORECASE)
+_NOISE_PROGRESS_RE = re.compile(r"\d+\.\d+/\d+.*kB", re.IGNORECASE)
+
+
+def _is_noise_line(line: str) -> bool:
+    """Return True if *line* is a progress bar, separator, or other low-signal row."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    # 纯分隔符行（---、===、###、***）
+    if _NOISE_SEPARATOR_RE.match(stripped):
+        return True
+    # pip/uv 进度行：含 eta 0:00:00
+    if _NOISE_ETA_RE.search(stripped):
+        return True
+    # 进度数字：100.0/100.0 kB
+    if _NOISE_PROGRESS_RE.search(stripped):
+        return True
+    # 大量 Unicode 框线字符（━ ┃ 等，ord > 0x2500）
+    box_chars = sum(1 for ch in stripped if 0x2500 <= ord(ch) <= 0x257F)
+    if box_chars >= 4:
+        return True
+    return False
+
+
+def _summarize_success_output(tool_name: str, output: str) -> str:
+    """将成功工具输出精简为历史友好的单行/短块摘要（≤ 300 字符）。
+
+    目标：进入 conversation 的内容本身就紧凑，无论是当轮还是历史轮
+    都能让 Agent 快速读取关键信息（路径、结论、退出码），而无需依赖
+    context_window 的行扫描压缩。
+    """
+    text = output.strip()
+    if not text:
+        return "(empty output)"
+
+    # 短输出直接透传（约 ≤ 80 tokens，~240 字符）
+    if len(text) <= 240:
+        return text
+
+    # 过滤进度条/纯分隔符等噪声行
+    lines = [
+        ln.rstrip()
+        for ln in text.splitlines()
+        if ln.strip() and not _is_noise_line(ln)
+    ]
+    if not lines:
+        lines = [text.splitlines()[0]] if text.splitlines() else [text[:200]]
+
+    # ── bash / shell 输出 ──────────────────────────────────────────
+    if tool_name == "bash":
+        # 提取退出码（末行形如 "exit:0" 或 "Exit code: 0"）
+        exit_hint = ""
+        last = lines[-1] if lines else ""
+        if re.match(r"^(exit|exit code)[:\s]*\d+$", last, re.IGNORECASE):
+            exit_hint = f" {last}"
+
+        # 优先取含成功关键词或路径的行（跳过退出码行本身）
+        success_kw = ("successfully", "installed", "created", "saved", "写入", "完成", "成功", "已生成")
+        path_kw = ("/", "路径", "文件")
+        key_lines: list[str] = []
+        for ln in lines:
+            if re.match(r"^(exit|exit code)[:\s]*\d+$", ln, re.IGNORECASE):
+                continue
+            lo = ln.lower()
+            if any(k in lo for k in success_kw) or any(k in ln for k in path_kw):
+                key_lines.append(ln[:160])
+            if len(key_lines) >= 3:
+                break
+
+        # 保底：取首行 + 尾行（排除退出码行）
+        if not key_lines:
+            non_exit = [ln for ln in lines if not re.match(r"^(exit|exit code)[:\s]*\d+$", ln, re.IGNORECASE)]
+            key_lines = [non_exit[0][:160]] if non_exit else [lines[0][:160]]
+            if len(non_exit) > 1:
+                key_lines.append(non_exit[-1][:160])
+
+        body = " | ".join(key_lines)
+        result_text = f"✓ {body}{exit_hint}"
+        return result_text if len(result_text) <= 300 else result_text[:297] + "..."
+
+    # ── file_write / file_edit ─────────────────────────────────────
+    if tool_name in {"file_write", "file_edit"}:
+        # 通常第一行就是摘要（"文件已写入: /path (N 字节)"）
+        return f"✓ {lines[0][:240]}"
+
+    # ── browser（search_images / navigate / screenshot）────────────
+    if tool_name == "browser":
+        # 取前 3 行含路径或 URL 的行，其余省略
+        key_lines = []
+        for ln in lines:
+            if "/" in ln or "http" in ln or "图片" in ln or "已下载" in ln:
+                key_lines.append(ln[:160])
+            if len(key_lines) >= 3:
+                break
+        if not key_lines:
+            key_lines = [lines[0][:200]]
+        return "✓ " + " | ".join(key_lines)
+
+    # ── 其他工具：通用短摘要 ───────────────────────────────────────
+    # 取首行 + 所有含路径的行（最多 2 条）
+    path_lines: list[str] = []
+    for ln in lines[1:]:
+        if ln.startswith("/") or "路径" in ln or "文件" in ln:
+            path_lines.append(ln[:120])
+        if len(path_lines) >= 2:
+            break
+
+    head = lines[0][:180]
+    if path_lines:
+        body = head + " | " + " ; ".join(path_lines)
+    else:
+        body = head
+    result_text = f"✓ {body}"
+    return result_text if len(result_text) <= 300 else result_text[:297] + "..."
+
+
+def format_tool_output(result: ToolResult, tool_name: str = "") -> str:
     if result.success:
-        return result.output or "(empty output)"
-    output = f"[ERROR] {result.error or 'unknown error'}\n{result.output}".strip()
+        return _summarize_success_output(tool_name, result.output or "")
+    summarized = _summarize_error_output(result.error or "unknown error", result.output or "")
+    output = f"[ERROR] {summarized}"
     diagnosis = diagnose_failure_hint(result)
     if diagnosis:
         output += f"\n[DIAGNOSIS] {diagnosis}"
@@ -348,11 +665,15 @@ def format_tool_output(result: ToolResult) -> str:
 
 
 def is_transient_cli_usage_error(result: ToolResult) -> bool:
-    """Return whether a failed tool result is just a CLI usage banner."""
+    """Return whether a failed result is a nano-banana argparse parse error."""
     if result.success:
         return False
-    text = f"{result.error or ''}\n{result.output or ''}".lower()
-    return "usage:" in text and "error:" in text and "--help" not in text
+    text = f"{result.error or ''}\n{result.output or ''}".strip()
+    if not text:
+        return False
+    if not _NANO_BANANA_ARGPARSE_ERROR_PATTERNS[0].search(text):
+        return False
+    return any(pattern.search(text) for pattern in _NANO_BANANA_ARGPARSE_ERROR_PATTERNS[1:])
 
 
 def diagnose_failure_hint(result: ToolResult) -> str:

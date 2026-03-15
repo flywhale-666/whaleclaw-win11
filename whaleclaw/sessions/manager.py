@@ -76,8 +76,29 @@ class SessionManager:
         for m in msg_rows:
             if m.role == "tool":
                 messages.append(Message(
+                    role="tool",  # type: ignore[arg-type]
+                    content=m.content,
+                    tool_call_id=m.tool_call_id,
+                ))
+            elif m.role == "assistant":
+                # assistant messages may carry tool_calls; stored as metadata JSON.
+                tool_calls_data: list[Any] = m.metadata.get("tool_calls", [])  # type: ignore[assignment]
+                tool_calls = None
+                if tool_calls_data:
+                    from whaleclaw.providers.base import ToolCall
+                    tool_calls = [
+                        ToolCall(
+                            id=tc.get("id", ""),
+                            name=tc.get("name", ""),
+                            arguments=tc.get("arguments", {}),
+                        )
+                        for tc in tool_calls_data
+                        if isinstance(tc, dict)
+                    ] or None
+                messages.append(Message(
                     role="assistant",  # type: ignore[arg-type]
                     content=m.content,
+                    tool_calls=tool_calls,
                 ))
             else:
                 messages.append(Message(
@@ -113,18 +134,63 @@ class SessionManager:
         *,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
+        tool_calls: list[Any] | None = None,
     ) -> None:
-        """Append a message to the session and persist it."""
-        mem_role = "assistant" if role == "tool" else role
-        msg = Message(role=mem_role, content=content)  # type: ignore[arg-type]
-        session.messages.append(msg)
+        """Append a message to the session and persist it.
+
+        Args:
+            tool_calls: Serialisable list of tool call dicts for assistant messages
+                        (each dict: {id, name, arguments}).  Stored in message
+                        metadata so they can be reconstructed on session reload.
+        """
+        from whaleclaw.providers.base import ToolCall  # local to avoid circular
+
+        if role == "tool":
+            # Keep the real 'tool' role in memory so repair logic works correctly.
+            mem_msg = Message(
+                role="tool",  # type: ignore[arg-type]
+                content=content,
+                tool_call_id=tool_call_id,
+            )
+        elif role == "assistant" and tool_calls:
+            tc_objects = [
+                ToolCall(
+                    id=tc.get("id", "") if isinstance(tc, dict) else tc.id,
+                    name=tc.get("name", "") if isinstance(tc, dict) else tc.name,
+                    arguments=tc.get("arguments", {}) if isinstance(tc, dict) else tc.arguments,
+                )
+                for tc in tool_calls
+            ] or None
+            mem_msg = Message(
+                role="assistant",  # type: ignore[arg-type]
+                content=content,
+                tool_calls=tc_objects,
+            )
+        else:
+            mem_msg = Message(role=role, content=content)  # type: ignore[arg-type]
+        session.messages.append(mem_msg)
         session.updated_at = datetime.now(UTC)
+
+        # Build metadata to persist tool_calls for assistant messages.
+        metadata: dict[str, object] | None = None
+        if role == "assistant" and tool_calls:
+            serialised = [
+                {
+                    "id": tc.get("id", "") if isinstance(tc, dict) else tc.id,
+                    "name": tc.get("name", "") if isinstance(tc, dict) else tc.name,
+                    "arguments": tc.get("arguments", {}) if isinstance(tc, dict) else tc.arguments,
+                }
+                for tc in tool_calls
+            ]
+            metadata = {"tool_calls": serialised}
+
         await self._store.add_message(
             session_id=session.id,
             role=role,
             content=content,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
+            metadata=metadata,
         )
         await self._store.update_session_field(
             session.id, updated_at=session.updated_at.isoformat()

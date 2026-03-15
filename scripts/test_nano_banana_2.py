@@ -25,8 +25,14 @@ _DEFAULT_MODEL = "gemini-3.1-flash-image-preview"
 _DEFAULT_EDIT_MODEL = "gemini-3.1-flash-image-preview"
 _MODEL_ALIASES = {
     "香蕉2": _DEFAULT_MODEL,
+    "香蕉 2": _DEFAULT_MODEL,
+    "banana2": _DEFAULT_MODEL,
+    "banana-2": _DEFAULT_MODEL,
     "香蕉pro": "nano-banana-2",
+    "香蕉 pro": "nano-banana-2",
+    "banana pro": "nano-banana-2",
     "nano-banana-2": "nano-banana-2",
+    "nano banana 2": "nano-banana-2",
     "gemini-3.1-flash-image-preview": _DEFAULT_MODEL,
 }
 _MODEL_DISPLAY_NAMES = {

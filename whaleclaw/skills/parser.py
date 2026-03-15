@@ -10,6 +10,9 @@ from typing import Any, cast
 import yaml
 from pydantic import BaseModel, Field
 
+# Bundled skills shipped with WhaleClaw — these must NOT trigger session lock.
+_BUNDLED_DIR = Path(__file__).resolve().parent / "bundled"
+
 
 class Skill(BaseModel):
     """Skill parsed from SKILL.md."""
@@ -25,6 +28,7 @@ class Skill(BaseModel):
     lock_session: bool = False
     param_guard: SkillParamGuard | None = None
     source_path: Path
+    is_user_installed: bool = False
 
 
 class SkillParamItem(BaseModel):
@@ -200,6 +204,7 @@ class SkillParser:
         examples = [e.strip() for e in examples_text.splitlines() if e.strip()]
 
         skill_id = path.parent.name
+        is_user_installed = not path.is_relative_to(_BUNDLED_DIR)
 
         return Skill(
             id=skill_id,
@@ -213,4 +218,5 @@ class SkillParser:
             lock_session=lock_session,
             param_guard=param_guard,
             source_path=path,
+            is_user_installed=is_user_installed,
         )

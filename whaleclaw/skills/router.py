@@ -14,11 +14,9 @@ class SkillRouter:
         self,
         user_message: str,
         available_skills: list[Skill],
-        max_skills: int = 2,
     ) -> list[Skill]:
-        """Select top skills by /use command or keyword score."""
+        """Return all matched skills by /use command, explicit mention, or trigger."""
         msg = user_message.strip()
-        lower = msg.lower()
         if msg.startswith("/use "):
             skill_id = msg[5:].strip().lower()
             for s in available_skills:
@@ -34,12 +32,11 @@ class SkillRouter:
                 explicit.append(s)
         if explicit:
             explicit.sort(key=lambda x: x.id)
-            return explicit[:max_skills]
+            return explicit
 
-        scored = [(self._score(msg, s), s) for s in available_skills]
-        scored = [(score, s) for score, s in scored if score > 0]
-        scored.sort(key=lambda x: (-x[0], x[1].id))
-        return [s for _, s in scored[:max_skills]]
+        matched = [s for s in available_skills if self._matches_trigger(msg, s)]
+        matched.sort(key=lambda x: x.id)
+        return matched
 
     _AUTOTRIGGER_SPLIT_RE = re.compile(r"[，,、/\s]+")
 
@@ -69,14 +66,13 @@ class SkillRouter:
                 out.append(t.strip())
         return out
 
-    def _score(self, message: str, skill: Skill) -> float:
-        """Return hit_count / total_triggers, 0 if no triggers."""
+    def _matches_trigger(self, message: str, skill: Skill) -> bool:
+        """Return whether any declared or derived trigger is present in the message."""
         triggers = skill.triggers if skill.triggers else self._auto_triggers(skill)
         if not triggers:
-            return 0.0
+            return False
         lower = message.lower()
-        hits = sum(1 for t in triggers if t.lower() in lower)
-        return hits / len(triggers)
+        return any(t.lower() in lower for t in triggers)
 
     @staticmethod
     def _norm_text(text: str) -> str:
