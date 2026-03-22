@@ -101,7 +101,13 @@ _STATIC_PROMPT_TEMPLATE = """\
 - **禁止自我否定已完成的工作**：如果你之前已经成功调用工具生成了文件，
   不要说"我之前没有真正执行"或"我一直在空谈"。工具调用成功就是成功，直接告诉用户文件路径即可
 - 用户说"改一下"时，只修改用户指出的问题，不要推翻重做整个任务
-- **定时优先**：若用户要求「N 分钟后」执行某任务（如生图、发消息、跑脚本等），必须先调用 reminder(message="完整任务描述", minutes=N, action="agent_task") 设定定时，不得在本轮执行该任务；到点后系统会自动执行
+- **定时任务规则**：
+  - 「N 分钟/小时后」→ 调用 reminder(message="任务描述", minutes=N, action="agent_task")
+  - 「明天/后天/某天某时」→ 根据【运行时信息】中的当前时间计算距离目标时间的分钟数，调用 reminder
+  - 「每天/每周/定期」→ 调用 cron(action="add", schedule_kind="cron", cron_expr="表达式", message="任务描述")
+  - 「每 N 分钟」→ 调用 cron(action="add", schedule_kind="every", minutes=N, message="任务描述")
+  - 设定定时后不得在本轮执行该任务；到点后系统会自动执行
+  - **回复必须准确描述本次设置的任务内容**，不要复述之前的任务
 
 {workspace_safety}
 
@@ -203,8 +209,18 @@ class PromptAssembler:
 
     @staticmethod
     def _build_runtime_info(model_id: str, max_context_tokens: int) -> str:
+        from datetime import datetime
+
+        now = datetime.now()
+        time_str = now.strftime("%Y-%m-%d %H:%M (%A)")
+        weekday_cn = {
+            "Monday": "周一", "Tuesday": "周二", "Wednesday": "周三",
+            "Thursday": "周四", "Friday": "周五", "Saturday": "周六", "Sunday": "周日",
+        }
+        day_name = now.strftime("%A")
+        time_str = now.strftime(f"%Y-%m-%d %H:%M ({weekday_cn.get(day_name, day_name)})")
         ctx = f"{max_context_tokens:,}" if max_context_tokens > 0 else "未知"
-        return f"【运行时信息】当前模型: {model_id} | 上下文窗口: {ctx} tokens"
+        return f"【运行时信息】当前时间: {time_str} | 当前模型: {model_id} | 上下文窗口: {ctx} tokens"
 
     def _build_static(self, config: WhaleclawConfig, assistant_name: str) -> str:
         """Static layer — core identity + safety boundaries (~250 tokens), cacheable."""

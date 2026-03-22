@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from whaleclaw.agent.helpers.tool_execution import create_default_registry
 from whaleclaw.config.paths import CONFIG_FILE, MEMORY_DIR, WHALECLAW_HOME, WORKSPACE_DIR
 from whaleclaw.config.schema import WhaleclawConfig
-from whaleclaw.cron.scheduler import CronAction, CronScheduler
+from whaleclaw.cron.scheduler import CronAction, CronJob, CronScheduler, Schedule
 from whaleclaw.cron.store import CronStore
 from whaleclaw.gateway.middleware import AuthMiddleware, create_jwt
 from whaleclaw.gateway.protocol import make_message
@@ -454,9 +454,14 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         await store.open()
         await cron_store.open()
 
+        cron_scheduler.set_persist(
+            on_save=cron_store.save_job,
+            on_delete=cron_store.delete_job,
+        )
+
         persisted = await cron_store.load_jobs()
         for job in persisted:
-            await cron_scheduler.add_job(job)
+            await cron_scheduler.add_job(job, persist=False)
 
         manager = SessionManager(store, config)
         state["manager"] = manager
@@ -1539,6 +1544,185 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 }
             )
         return result
+
+    # ── Cron REST ─────────────────────────────────────────
+
+    def _job_to_dict(job: CronJob) -> dict[str, Any]:
+        sched = job.schedule_obj
+        sched_kind = sched.kind if sched else "cron"
+        sched_detail: dict[str, Any] = {}
+        if sched:
+            if sched.kind == "at" and sched.at:
+                sched_detail["at"] = sched.at.isoformat()
+            elif sched.kind == "every":
+                sched_detail["every_minutes"] = sched.every_seconds // 60
+            elif sched.kind == "cron":
+                sched_detail["cron_expr"] = sched.expr or job.schedule
+        else:
+            sched_detail["cron_expr"] = job.schedule
+        message = ""
+        if job.action.payload:
+            message = job.action.payload.get("text", "")
+        return {
+            "id": job.id,
+            "name": job.name,
+            "schedule_kind": sched_kind,
+            "enabled": job.enabled,
+            "one_shot": job.one_shot,
+            "created_at": job.created_at.isoformat(),
+            "last_run": job.last_run.isoformat() if job.last_run else None,
+            "message": message,
+            **sched_detail,
+        }
+
+    @app.get("/api/cron/jobs")
+    async def _api_list_cron_jobs() -> list[dict[str, Any]]:
+        jobs = await cron_scheduler.list_jobs()
+        return [_job_to_dict(j) for j in jobs]
+
+    @app.post("/api/cron/jobs")
+    async def _api_add_cron_job(body: dict[str, Any]) -> JSONResponse:
+        from datetime import datetime, timedelta
+        from uuid import uuid4
+
+        name = str(body.get("name", "")).strip()
+        message = str(body.get("message", "")).strip()
+        kind = str(body.get("schedule_kind", "at")).lower()
+
+        if not message:
+            return JSONResponse({"error": "缺少 message"}, status_code=400)
+
+        now = datetime.now()
+
+        if kind == "at":
+            raw_min = body.get("minutes")
+            if raw_min is None:
+                return JSONResponse({"error": "at 类型需要 minutes"}, status_code=400)
+            try:
+                minutes = int(raw_min)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "minutes 必须为整数"}, status_code=400)
+            if minutes < 1:
+                return JSONResponse({"error": "minutes 必须大于 0"}, status_code=400)
+            target_time = now + timedelta(minutes=minutes)
+            sched = Schedule(kind="at", at=target_time)
+            auto_name = name or f"提醒: {message[:20]}"
+            one_shot = True
+
+        elif kind == "cron":
+            cron_expr = str(body.get("cron_expr", "")).strip()
+            if not cron_expr:
+                return JSONResponse({"error": "cron 类型需要 cron_expr"}, status_code=400)
+            parts = cron_expr.split()
+            if len(parts) != 5:
+                return JSONResponse({"error": "cron 表达式需要 5 个字段"}, status_code=400)
+            sched = Schedule(kind="cron", expr=cron_expr)
+            auto_name = name or f"定时: {message[:20]}"
+            one_shot = False
+
+        elif kind == "every":
+            raw_min = body.get("minutes")
+            if raw_min is None:
+                return JSONResponse({"error": "every 类型需要 minutes"}, status_code=400)
+            try:
+                minutes = int(raw_min)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "minutes 必须为整数"}, status_code=400)
+            if minutes < 1:
+                return JSONResponse({"error": "间隔必须大于 0 分钟"}, status_code=400)
+            sched = Schedule(kind="every", every_seconds=minutes * 60)
+            auto_name = name or f"循环: {message[:20]}"
+            one_shot = False
+
+        else:
+            return JSONResponse({"error": f"未知调度类型: {kind}"}, status_code=400)
+
+        job = CronJob(
+            id=f"cron-{uuid4().hex[:12]}",
+            name=auto_name,
+            schedule_obj=sched,
+            action=CronAction(type="message", target="user", payload={"text": message}),
+            enabled=True,
+            created_at=now,
+            one_shot=one_shot,
+        )
+        await cron_scheduler.add_job(job)
+        return JSONResponse(_job_to_dict(job))
+
+    @app.put("/api/cron/jobs/{job_id}")
+    async def _api_update_cron_job(job_id: str, body: dict[str, Any]) -> JSONResponse:
+        from datetime import datetime, timedelta
+
+        jobs = await cron_scheduler.list_jobs()
+        old = next((j for j in jobs if j.id == job_id), None)
+        if not old:
+            return JSONResponse({"error": "任务不存在"}, status_code=404)
+
+        name = str(body.get("name", old.name)).strip()
+        message = str(body.get("message", "")).strip()
+        kind = str(body.get("schedule_kind", "")).lower()
+
+        if not message:
+            old_msg = old.action.payload.get("text", "") if old.action.payload else ""
+            message = old_msg
+        if not message:
+            return JSONResponse({"error": "缺少 message"}, status_code=400)
+
+        now = datetime.now()
+        sched = old.schedule_obj
+        one_shot = old.one_shot
+
+        if kind and kind != (sched.kind if sched else ""):
+            if kind == "at":
+                raw_min = body.get("minutes")
+                if raw_min is None:
+                    return JSONResponse({"error": "at 类型需要 minutes"}, status_code=400)
+                minutes = int(raw_min)
+                sched = Schedule(kind="at", at=now + timedelta(minutes=minutes))
+                one_shot = True
+            elif kind == "cron":
+                cron_expr = str(body.get("cron_expr", "")).strip()
+                if not cron_expr:
+                    return JSONResponse({"error": "cron 类型需要 cron_expr"}, status_code=400)
+                sched = Schedule(kind="cron", expr=cron_expr)
+                one_shot = False
+            elif kind == "every":
+                raw_min = body.get("minutes")
+                if raw_min is None:
+                    return JSONResponse({"error": "every 类型需要 minutes"}, status_code=400)
+                minutes = int(raw_min)
+                sched = Schedule(kind="every", every_seconds=minutes * 60)
+                one_shot = False
+        else:
+            if sched and sched.kind == "at" and "minutes" in body:
+                minutes = int(body["minutes"])
+                sched = Schedule(kind="at", at=now + timedelta(minutes=minutes))
+            elif sched and sched.kind == "cron" and "cron_expr" in body:
+                sched = Schedule(kind="cron", expr=str(body["cron_expr"]).strip())
+            elif sched and sched.kind == "every" and "minutes" in body:
+                minutes = int(body["minutes"])
+                sched = Schedule(kind="every", every_seconds=minutes * 60)
+
+        enabled = body.get("enabled", old.enabled)
+
+        updated = CronJob(
+            id=old.id,
+            name=name,
+            schedule_obj=sched,
+            action=CronAction(type="message", target="user", payload={"text": message}),
+            enabled=bool(enabled),
+            created_at=old.created_at,
+            one_shot=one_shot,
+            last_run=old.last_run,
+        )
+        await cron_scheduler.remove_job(job_id)
+        await cron_scheduler.add_job(updated)
+        return JSONResponse(_job_to_dict(updated))
+
+    @app.delete("/api/cron/jobs/{job_id}")
+    async def _api_delete_cron_job(job_id: str) -> JSONResponse:
+        await cron_scheduler.remove_job(job_id)
+        return JSONResponse({"ok": True})
 
     # ── Plugins REST ──────────────────────────────────────
 

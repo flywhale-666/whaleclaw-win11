@@ -14,13 +14,19 @@ import asyncio
 import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import lark_oapi as lark
+import websockets
 from lark_oapi.api.im.v1 import P2ImMessageReceiveV1
-
+from lark_oapi.core.log import logger as lark_logger
+from lark_oapi.ws.const import DEVICE_ID, SERVICE_ID
 from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
+
+_WS_OPEN_TIMEOUT = 30
+_WS_PING_INTERVAL = 120
 
 
 class FeishuWSBridge:
@@ -52,6 +58,60 @@ class FeishuWSBridge:
         except Exception:
             log.exception("feishu.ws.handle_error")
 
+    @staticmethod
+    def _patch_sdk_connect(sdk_client: lark.ws.Client) -> None:
+        """Monkey-patch the SDK's ``_connect`` to pass proxy-friendly timeouts.
+
+        The stock ``lark-oapi`` calls ``websockets.connect(url)`` with the
+        default ``open_timeout=10``.  When the system HTTP proxy is active
+        (e.g. Clash global mode), the CONNECT tunnel adds latency and 10 s
+        is often not enough, causing *timed out during opening handshake*.
+
+        This patch replaces ``_connect`` so that ``websockets.connect`` is
+        called with a larger ``open_timeout`` and explicit ``ping_interval``
+        while keeping all other SDK behaviour intact.
+        """
+        import lark_oapi.ws.client as _ws_mod
+
+        original_lock = sdk_client._lock  # noqa: SLF001
+
+        async def _patched_connect() -> None:
+            await original_lock.acquire()
+            if sdk_client._conn is not None:  # noqa: SLF001
+                return
+            try:
+                conn_url = sdk_client._get_conn_url()  # noqa: SLF001
+                u = urlparse(conn_url)
+                q = parse_qs(u.query)
+                conn_id = q[DEVICE_ID][0]
+                service_id = q[SERVICE_ID][0]
+
+                conn = await websockets.connect(
+                    conn_url,
+                    open_timeout=_WS_OPEN_TIMEOUT,
+                    ping_interval=_WS_PING_INTERVAL,
+                    ping_timeout=_WS_PING_INTERVAL,
+                )
+                sdk_client._conn = conn  # noqa: SLF001
+                sdk_client._conn_url = conn_url  # noqa: SLF001
+                sdk_client._conn_id = conn_id  # noqa: SLF001
+                sdk_client._service_id = service_id  # noqa: SLF001
+
+                lark_logger.info(
+                    sdk_client._fmt_log("connected to {}", conn_url),  # noqa: SLF001
+                )
+                _ws_mod.loop.create_task(
+                    sdk_client._receive_message_loop(),  # noqa: SLF001
+                )
+            except websockets.InvalidStatusCode as e:
+                from lark_oapi.ws.client import _parse_ws_conn_exception
+
+                _parse_ws_conn_exception(e)
+            finally:
+                original_lock.release()
+
+        sdk_client._connect = _patched_connect  # type: ignore[assignment]  # noqa: SLF001
+
     def _run(self) -> None:
         """Entry point for the daemon thread.
 
@@ -77,6 +137,7 @@ class FeishuWSBridge:
             event_handler=handler,
             log_level=lark.LogLevel.INFO,
         )
+        self._patch_sdk_connect(self._ws_client)
         log.info("feishu.ws.connecting")
         try:
             self._ws_client.start()

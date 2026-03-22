@@ -116,16 +116,37 @@ class CronScheduler:
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._on_fire = on_fire
+        self._on_save: Callable[["CronJob"], Awaitable[None]] | None = None
+        self._on_delete: Callable[[str], Awaitable[None]] | None = None
 
     def set_on_fire(self, callback: OnFireCallback) -> None:
         """Register callback invoked when a job fires."""
         self._on_fire = callback
 
-    async def add_job(self, job: CronJob) -> None:
-        self._jobs[job.id] = job
+    def set_persist(
+        self,
+        on_save: Callable[["CronJob"], Awaitable[None]],
+        on_delete: Callable[[str], Awaitable[None]],
+    ) -> None:
+        """Register persistence callbacks for automatic save/delete on mutations."""
+        self._on_save = on_save
+        self._on_delete = on_delete
 
-    async def remove_job(self, job_id: str) -> None:
+    async def add_job(self, job: CronJob, *, persist: bool = True) -> None:
+        self._jobs[job.id] = job
+        if persist and self._on_save is not None:
+            try:
+                await self._on_save(job)
+            except Exception:
+                logger.warning("cron_persist_save_failed", job_id=job.id)
+
+    async def remove_job(self, job_id: str, *, persist: bool = True) -> None:
         self._jobs.pop(job_id, None)
+        if persist and self._on_delete is not None:
+            try:
+                await self._on_delete(job_id)
+            except Exception:
+                logger.warning("cron_persist_delete_failed", job_id=job_id)
 
     async def list_jobs(self) -> list[CronJob]:
         return list(self._jobs.values())
@@ -145,7 +166,7 @@ class CronScheduler:
                 logger.error("cron_job_fire_failed", job_id=job_id, error=str(exc))
 
         if job.one_shot:
-            self._jobs.pop(job_id, None)
+            await self.remove_job(job_id)
             logger.info("cron_job_removed_one_shot", job_id=job_id)
 
     def _should_run(self, job: CronJob, now: datetime) -> bool:

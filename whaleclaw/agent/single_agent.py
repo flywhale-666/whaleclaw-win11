@@ -2542,11 +2542,18 @@ async def run_agent(
     if _active_hooks_for_exec is not None and final_text:
         final_text = _active_hooks_for_exec.postprocess_reply(final_text, session)
 
-    # Bug 4: force-append cron/reminder notices if LLM omitted them
+    # Bug 4: force-append cron/reminder notices if LLM omitted them.
+    # Bug 4b: when the *only* successful tools were cron/reminder (deferred intent),
+    # the LLM sometimes hallucinates reply text from a previous turn.  In that case,
+    # replace the entire reply with a clean confirmation built from the tool output.
     if _cron_reminder_notices:
-        for notice in _cron_reminder_notices:
-            if notice not in final_text:
-                final_text = f"{final_text.rstrip()}\n（{notice}）" if final_text else f"（{notice}）"
+        _only_cron_tools = is_deferred and successful_tool_calls <= len(_cron_reminder_notices)
+        if _only_cron_tools:
+            final_text = "好的，" + "；".join(_cron_reminder_notices) + "。"
+        else:
+            for notice in _cron_reminder_notices:
+                if notice not in final_text:
+                    final_text = f"{final_text.rstrip()}\n（{notice}）" if final_text else f"（{notice}）"
 
     if lock_is_explicit and locked_skill_ids and skill_announce_pending:
         announce = _skill_announcement(locked_skill_ids, previous_locked_skill_ids)

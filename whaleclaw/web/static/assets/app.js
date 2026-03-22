@@ -129,6 +129,26 @@ createApp({
     const mcpRemoving = reactive({});
     const mcpReconnecting = reactive({});
 
+    /* ── Cron Jobs ── */
+    const cronJobs = ref([]);
+    const cronLoading = ref(false);
+    const cronSaving = ref(false);
+    const cronFormName = ref('');
+    const cronFormMessage = ref('');
+    const cronFormKind = ref('daily');
+    const cronFormMinutes = ref(30);
+    const cronFormCronExpr = ref('0 9 * * *');
+    const cronEditingId = ref('');
+    const cronFormHour = ref(9);
+    const cronFormMinute = ref(0);
+    const cronFormWeekday = ref(1);
+    const cronFormIntervalValue = ref(30);
+    const cronFormIntervalUnit = ref('minutes');
+    const cronFormOnceDate = ref('');
+    const cronFormOnceTime = ref('09:00');
+    const cronFormDelayValue = ref(30);
+    const cronFormDelayUnit = ref('minutes');
+
     const clawhubConfigLoading = ref(false);
     const clawhubConfigSaving = ref(false);
     const clawhubCliInstalling = ref(false);
@@ -694,6 +714,230 @@ createApp({
       } finally {
         delete mcpReconnecting[serverId];
       }
+    }
+
+    /* ── Cron Jobs ── */
+    async function loadCronJobs() {
+      cronLoading.value = true;
+      try {
+        cronJobs.value = await apiFetch('/api/cron/jobs');
+      } catch { /* ignore */ }
+      finally { cronLoading.value = false; }
+    }
+
+    function resetCronForm() {
+      cronFormName.value = '';
+      cronFormMessage.value = '';
+      cronFormKind.value = 'daily';
+      cronFormMinutes.value = 30;
+      cronFormCronExpr.value = '0 9 * * *';
+      cronEditingId.value = '';
+      cronFormHour.value = 9;
+      cronFormMinute.value = 0;
+      cronFormWeekday.value = 1;
+      cronFormIntervalValue.value = 30;
+      cronFormIntervalUnit.value = 'minutes';
+      cronFormOnceDate.value = '';
+      cronFormOnceTime.value = '09:00';
+      cronFormDelayValue.value = 30;
+      cronFormDelayUnit.value = 'minutes';
+    }
+
+    function buildCronPayload() {
+      const kind = cronFormKind.value;
+      const base = {
+        name: cronFormName.value.trim(),
+        message: cronFormMessage.value.trim(),
+      };
+      if (kind === 'daily') {
+        const h = Number(cronFormHour.value);
+        const m = Number(cronFormMinute.value);
+        return { ...base, schedule_kind: 'cron', cron_expr: `${m} ${h} * * *` };
+      }
+      if (kind === 'weekly') {
+        const h = Number(cronFormHour.value);
+        const m = Number(cronFormMinute.value);
+        const w = Number(cronFormWeekday.value);
+        return { ...base, schedule_kind: 'cron', cron_expr: `${m} ${h} * * ${w}` };
+      }
+      if (kind === 'interval') {
+        let mins = Number(cronFormIntervalValue.value);
+        if (cronFormIntervalUnit.value === 'hours') mins *= 60;
+        return { ...base, schedule_kind: 'every', minutes: mins };
+      }
+      if (kind === 'once') {
+        const dateStr = cronFormOnceDate.value;
+        const timeStr = cronFormOnceTime.value || '09:00';
+        if (!dateStr) {
+          throw new Error('请选择日期');
+        }
+        const target = new Date(`${dateStr}T${timeStr}`);
+        const now = new Date();
+        const diffMs = target.getTime() - now.getTime();
+        if (diffMs < 60000) {
+          throw new Error('目标时间必须在当前时间之后');
+        }
+        return { ...base, schedule_kind: 'at', minutes: Math.ceil(diffMs / 60000) };
+      }
+      if (kind === 'delay') {
+        let mins = Number(cronFormDelayValue.value);
+        if (cronFormDelayUnit.value === 'hours') mins *= 60;
+        if (mins < 1) throw new Error('时间必须大于 0');
+        return { ...base, schedule_kind: 'at', minutes: mins };
+      }
+      if (kind === 'advanced') {
+        return { ...base, schedule_kind: 'cron', cron_expr: cronFormCronExpr.value.trim() };
+      }
+      return base;
+    }
+
+    async function saveCronJob() {
+      if (!cronFormMessage.value.trim()) {
+        showUiAlert('请填写任务消息/指令');
+        return;
+      }
+      cronSaving.value = true;
+      try {
+        const payload = buildCronPayload();
+        if (cronEditingId.value) {
+          await apiFetch(`/api/cron/jobs/${encodeURIComponent(cronEditingId.value)}`, {
+            method: 'PUT',
+            body: JSON.stringify(payload),
+          });
+        } else {
+          await apiFetch('/api/cron/jobs', {
+            method: 'POST',
+            body: JSON.stringify(payload),
+          });
+        }
+        resetCronForm();
+        await loadCronJobs();
+      } catch (e) {
+        showUiAlert('保存定时任务失败: ' + (e.message || e));
+      } finally {
+        cronSaving.value = false;
+      }
+    }
+
+    async function deleteCronJob(jobId) {
+      try {
+        await apiFetch(`/api/cron/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+        await loadCronJobs();
+      } catch (e) {
+        showUiAlert('删除定时任务失败: ' + (e.message || e));
+      }
+    }
+
+    function editCronJob(job) {
+      cronEditingId.value = job.id;
+      cronFormName.value = job.name || '';
+      cronFormMessage.value = job.message || '';
+
+      if (job.schedule_kind === 'every') {
+        cronFormKind.value = 'interval';
+        const mins = job.every_minutes || 30;
+        if (mins >= 60 && mins % 60 === 0) {
+          cronFormIntervalValue.value = mins / 60;
+          cronFormIntervalUnit.value = 'hours';
+        } else {
+          cronFormIntervalValue.value = mins;
+          cronFormIntervalUnit.value = 'minutes';
+        }
+      } else if (job.schedule_kind === 'at') {
+        if (job.at) {
+          cronFormKind.value = 'once';
+          try {
+            const d = new Date(job.at);
+            cronFormOnceDate.value = d.toISOString().slice(0, 10);
+            cronFormOnceTime.value = d.toTimeString().slice(0, 5);
+          } catch { /* fallback */ }
+        } else {
+          cronFormKind.value = 'delay';
+          cronFormDelayValue.value = 30;
+          cronFormDelayUnit.value = 'minutes';
+        }
+      } else if (job.schedule_kind === 'cron' && job.cron_expr) {
+        const parts = (job.cron_expr || '').split(/\s+/);
+        if (parts.length === 5) {
+          const [mm, hh, dom, mon, dow] = parts;
+          if (dom === '*' && mon === '*' && dow === '*' && /^\d+$/.test(mm) && /^\d+$/.test(hh)) {
+            cronFormKind.value = 'daily';
+            cronFormHour.value = Number(hh);
+            cronFormMinute.value = Number(mm);
+          } else if (dom === '*' && mon === '*' && /^\d$/.test(dow) && /^\d+$/.test(mm) && /^\d+$/.test(hh)) {
+            cronFormKind.value = 'weekly';
+            cronFormHour.value = Number(hh);
+            cronFormMinute.value = Number(mm);
+            cronFormWeekday.value = Number(dow);
+          } else {
+            cronFormKind.value = 'advanced';
+            cronFormCronExpr.value = job.cron_expr;
+          }
+        } else {
+          cronFormKind.value = 'advanced';
+          cronFormCronExpr.value = job.cron_expr || '';
+        }
+      } else {
+        cronFormKind.value = 'daily';
+      }
+    }
+
+    function clampMinute(val) {
+      let n = parseInt(val, 10);
+      if (isNaN(n)) return 0;
+      if (n > 59) return 59;
+      if (n < 0) return 0;
+      return n;
+    }
+
+    function onMinuteKeydown(e) {
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        cronFormMinute.value = cronFormMinute.value >= 59 ? 0 : cronFormMinute.value + 1;
+        e.target.value = cronFormMinute.value;
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        cronFormMinute.value = cronFormMinute.value <= 0 ? 59 : cronFormMinute.value - 1;
+        e.target.value = cronFormMinute.value;
+      }
+    }
+
+    function cancelCronEdit() {
+      resetCronForm();
+    }
+
+    const _WEEKDAY_NAMES = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+
+    function describeCronSchedule(job) {
+      if (job.schedule_kind === 'at') {
+        if (job.at) {
+          try {
+            const d = new Date(job.at);
+            return '一次性: ' + d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+          } catch { return '一次性'; }
+        }
+        return '一次性';
+      }
+      if (job.schedule_kind === 'every') {
+        const m = job.every_minutes || 0;
+        if (m >= 60 && m % 60 === 0) return `每 ${m / 60} 小时`;
+        return `每 ${m} 分钟`;
+      }
+      if (job.schedule_kind === 'cron' && job.cron_expr) {
+        const parts = (job.cron_expr || '').split(/\s+/);
+        if (parts.length === 5) {
+          const [mm, hh, dom, mon, dow] = parts;
+          const pad = (n) => String(n).padStart(2, '0');
+          if (dom === '*' && mon === '*' && dow === '*' && /^\d+$/.test(mm) && /^\d+$/.test(hh)) {
+            return `每天 ${pad(hh)}:${pad(mm)}`;
+          }
+          if (dom === '*' && mon === '*' && /^\d$/.test(dow) && /^\d+$/.test(mm) && /^\d+$/.test(hh)) {
+            return `每${_WEEKDAY_NAMES[Number(dow)] || '周?'} ${pad(hh)}:${pad(mm)}`;
+          }
+        }
+        return 'cron: ' + job.cron_expr;
+      }
+      return job.schedule_kind || '';
     }
 
     const _MA_SCENARIO_BUILTINS = [
@@ -2156,6 +2400,9 @@ createApp({
       toolDetail,
       mcpServers, mcpLoading, mcpRemoving, mcpReconnecting,
       loadMcpServers, removeMcpServer, reconnectMcpServer,
+      cronJobs, cronLoading, cronSaving, cronFormName, cronFormMessage, cronFormKind, cronFormMinutes, cronFormCronExpr, cronEditingId,
+      cronFormHour, cronFormMinute, cronFormWeekday, cronFormIntervalValue, cronFormIntervalUnit, cronFormOnceDate, cronFormOnceTime, cronFormDelayValue, cronFormDelayUnit,
+      loadCronJobs, saveCronJob, deleteCronJob, editCronJob, cancelCronEdit, describeCronSchedule, clampMinute, onMinuteKeydown,
       memoryStyle, memoryStyleEnabled, memoryStyleSource, memoryStyleLoading, memoryStyleSaving, memoryStyleLastRefresh, memoryStyleRefreshNote,
       loadMemoryStyle, onMemoryStyleRefresh, saveMemoryStyle, pendingClearMemoryStyle, openClearMemoryStyleDialog, closeClearMemoryStyleDialog, confirmClearMemoryStyle,
       evomapEnabled, evomapLoading, loadEvomapSetting, setEvomapEnabled,
@@ -2229,6 +2476,7 @@ createApp({
           <button class="sidebar-tab" :class="{ active: activeTab === 'skills' }" @click="activeTab = 'skills'; loadSkills(); loadClawhubConfig()">🧩 技能</button>
           <button class="sidebar-tab" :class="{ active: activeTab === 'multi-agent' }" @click="activeTab = 'multi-agent'; loadModels(); loadMultiAgentConfig()">🧠 多Agent</button>
           <button class="sidebar-tab" :class="{ active: activeTab === 'tools' }" @click="activeTab = 'tools'; loadTools()">🔧 工具</button>
+          <button class="sidebar-tab" :class="{ active: activeTab === 'cron' }" @click="activeTab = 'cron'; loadCronJobs()">⏰ 定时任务</button>
           <button class="sidebar-tab" :class="{ active: activeTab === 'mcp' }" @click="activeTab = 'mcp'; loadMcpServers()">🔌 MCP</button>
         </div>
       </aside>
@@ -2273,6 +2521,7 @@ createApp({
           <h2 v-if="activeTab === 'skills'">🧩 技能管理</h2>
           <h2 v-if="activeTab === 'multi-agent'">🧠 多Agent 编排</h2>
           <h2 v-if="activeTab === 'tools'">🔧 工具列表 <small>({{ tools.length }})</small></h2>
+          <h2 v-if="activeTab === 'cron'">⏰ 定时任务 <small>({{ cronJobs.length }})</small></h2>
           <h2 v-if="activeTab === 'mcp'">🔌 MCP 服务 <small>({{ mcpServers.length }})</small></h2>
         </div>
 
@@ -2596,6 +2845,123 @@ createApp({
                   </div>
                 </div>
               </details>
+            </div>
+          </div>
+        </template>
+
+        <!-- Cron Tab -->
+        <template v-if="activeTab === 'cron'">
+          <div class="tab-content">
+            <div class="tab-content-body">
+              <div class="cron-layout">
+                <!-- Left: Form -->
+                <div class="cron-form-panel">
+                  <h3 class="cron-panel-title">{{ cronEditingId ? '编辑任务' : '新建定时任务' }}</h3>
+                  <div class="cron-form-group">
+                    <label class="cron-label">任务名称</label>
+                    <input class="cron-input" v-model="cronFormName" placeholder="可选，留空自动生成" />
+                  </div>
+                  <div class="cron-form-group">
+                    <label class="cron-label">任务消息/指令 <span style="color:var(--danger)">*</span></label>
+                    <textarea class="cron-textarea" v-model="cronFormMessage" placeholder="触发时发送的消息或要执行的指令" rows="3"></textarea>
+                  </div>
+                  <div class="cron-form-group">
+                    <label class="cron-label">调度类型</label>
+                    <select class="cron-select" v-model="cronFormKind">
+                      <option value="daily">每天定时</option>
+                      <option value="weekly">每周定时</option>
+                      <option value="interval">固定间隔（重复）</option>
+                      <option value="once">指定日期时间（一次性）</option>
+                      <option value="delay">N 分钟/小时后（一次性）</option>
+                      <option value="advanced">高级（Cron 表达式）</option>
+                    </select>
+                  </div>
+                  <div class="cron-form-group" v-if="cronFormKind === 'daily' || cronFormKind === 'weekly'">
+                    <label class="cron-label">{{ cronFormKind === 'weekly' ? '星期' : '' }}</label>
+                    <select v-if="cronFormKind === 'weekly'" class="cron-select" v-model.number="cronFormWeekday">
+                      <option :value="1">周一</option>
+                      <option :value="2">周二</option>
+                      <option :value="3">周三</option>
+                      <option :value="4">周四</option>
+                      <option :value="5">周五</option>
+                      <option :value="6">周六</option>
+                      <option :value="0">周日</option>
+                    </select>
+                    <label class="cron-label" style="margin-top:8px">时间</label>
+                    <div class="cron-time-row">
+                      <select class="cron-select cron-time-select" v-model.number="cronFormHour">
+                        <option v-for="h in 24" :key="h-1" :value="h-1">{{ String(h-1).padStart(2,'0') }} 时</option>
+                      </select>
+                      <span class="cron-time-sep">:</span>
+                      <input class="cron-input cron-time-select" type="number" :value="cronFormMinute" min="0" max="59" placeholder="00" @input="cronFormMinute = clampMinute($event.target.value)" @blur="$event.target.value = cronFormMinute" @keydown="onMinuteKeydown" />
+                    </div>
+                  </div>
+                  <div class="cron-form-group" v-if="cronFormKind === 'interval'">
+                    <label class="cron-label">执行间隔</label>
+                    <div class="cron-time-row">
+                      <input class="cron-input" type="number" v-model.number="cronFormIntervalValue" min="1" style="flex:1" />
+                      <select class="cron-select" v-model="cronFormIntervalUnit" style="width:auto;min-width:80px">
+                        <option value="minutes">分钟</option>
+                        <option value="hours">小时</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="cron-form-group" v-if="cronFormKind === 'once'">
+                    <label class="cron-label">执行日期</label>
+                    <input class="cron-input" type="date" v-model="cronFormOnceDate" />
+                    <label class="cron-label" style="margin-top:8px">执行时间</label>
+                    <input class="cron-input" type="time" v-model="cronFormOnceTime" />
+                  </div>
+                  <div class="cron-form-group" v-if="cronFormKind === 'delay'">
+                    <label class="cron-label">多久后执行</label>
+                    <div class="cron-time-row">
+                      <input class="cron-input" type="number" v-model.number="cronFormDelayValue" min="1" style="flex:1" />
+                      <select class="cron-select" v-model="cronFormDelayUnit" style="width:auto;min-width:80px">
+                        <option value="minutes">分钟</option>
+                        <option value="hours">小时</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="cron-form-group" v-if="cronFormKind === 'advanced'">
+                    <label class="cron-label">Cron 表达式</label>
+                    <input class="cron-input" v-model="cronFormCronExpr" placeholder="分 时 日 月 星期" />
+                    <div class="cron-hint">5 字段: 分(0-59) 时(0-23) 日(1-31) 月(1-12) 星期(0-6, 0=周日)</div>
+                    <div class="cron-hint-examples">
+                      示例：<code>0 9 * * *</code> 每天9点 · <code>0 9 * * 1</code> 每周一9点 · <code>0 9,18 * * *</code> 每天9和18点
+                    </div>
+                  </div>
+                  <div class="cron-form-actions">
+                    <button class="btn-pill" :disabled="cronSaving" @click="saveCronJob">{{ cronSaving ? '保存中…' : (cronEditingId ? '更新任务' : '创建任务') }}</button>
+                    <button v-if="cronEditingId" class="btn-outline" @click="cancelCronEdit">取消编辑</button>
+                  </div>
+                </div>
+                <!-- Right: List -->
+                <div class="cron-list-panel">
+                  <h3 class="cron-panel-title" style="display:flex;align-items:center;gap:8px">现有任务 <button class="btn-icon" :disabled="cronLoading" @click="loadCronJobs()" title="刷新" style="font-size:14px">🔄</button></h3>
+                  <div v-if="cronLoading" class="tab-empty" style="padding:30px 0">加载中…</div>
+                  <div v-else-if="!cronJobs.length" class="tab-empty" style="padding:30px 0">暂无定时任务</div>
+                  <div v-else class="cron-job-list">
+                    <div v-for="job in cronJobs" :key="job.id" class="cron-job-card" :class="{ disabled: !job.enabled }">
+                      <div class="cron-job-main">
+                        <div class="cron-job-name">{{ job.name }}</div>
+                        <div class="cron-job-schedule">{{ describeCronSchedule(job) }}</div>
+                        <div class="cron-job-message">{{ job.message }}</div>
+                        <div class="cron-job-meta">
+                          <span v-if="job.one_shot" class="chip">一次性</span>
+                          <span v-else class="chip chip-ok">重复</span>
+                          <span v-if="!job.enabled" class="chip" style="color:var(--danger)">已禁用</span>
+                          <span class="cron-job-time">创建: {{ new Date(job.created_at).toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }) }}</span>
+                          <span v-if="job.last_run" class="cron-job-time">上次: {{ new Date(job.last_run).toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }) }}</span>
+                        </div>
+                      </div>
+                      <div class="cron-job-actions">
+                        <button class="btn-mini" @click="editCronJob(job)" title="编辑">✏️</button>
+                        <button class="btn-danger-sm" @click="deleteCronJob(job.id)" title="删除">🗑️</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </template>
