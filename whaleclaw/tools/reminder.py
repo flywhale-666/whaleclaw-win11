@@ -24,24 +24,28 @@ class ReminderTool(Tool):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="reminder",
-            description="Set a reminder or schedule an agent task after N minutes.",
+            description=(
+                "设置定时提醒或延迟执行 Agent 任务。"
+                "指定消息内容和延迟分钟数，到时间后自动触发。"
+                "用户说「N 分钟/小时后做某事」时，应使用此工具。"
+            ),
             parameters=[
                 ToolParameter(
                     name="message",
                     type="string",
-                    description="Reminder message or agent task instruction.",
+                    description="提醒消息内容，或到时间后要执行的 Agent 任务指令。",
                 ),
                 ToolParameter(
                     name="minutes",
                     type="integer",
-                    description="Minutes from now to trigger.",
+                    description="从现在起多少分钟后触发。",
                 ),
                 ToolParameter(
                     name="action",
                     type="string",
                     description=(
-                        "Action type: 'message' (default) sends a reminder notification; "
-                        "'agent_task' runs the message as an agent instruction after the delay."
+                        "动作类型：'message'（默认）到时间后发送提醒通知；"
+                        "'agent_task' 到时间后将 message 作为 Agent 指令自动执行。"
                     ),
                     required=False,
                     enum=["message", "agent_task"],

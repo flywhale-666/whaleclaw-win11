@@ -68,6 +68,15 @@ typeCheckingMode = "strict"
 venvPath = "."
 venv = "python"
 
+# 测试目录：允许私有 API、放宽属性/未知类型检查，并确保能解析 whaleclaw 包
+[[tool.pyright.executionEnvironments]]
+root = "tests"
+extraPaths = ["."]
+reportPrivateUsage = "none"
+reportAttributeAccessIssue = "none"
+reportUnknownVariableType = "none"
+reportUnknownParameterType = "none"
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

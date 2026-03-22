@@ -2461,11 +2461,11 @@ createApp({
                         </div>
                         <div class="chip-row">
                           <span class="chip chip-accent">{{ item.slug }}</span>
-                          <span v-if="item.version" class="chip">v{{ item.version }}</span>
+                          <span v-if="item.version && item.version !== 'None'" class="chip">v{{ item.version }}</span>
                         </div>
                       </div>
                       <div class="panel-card-action">
-                        <button class="btn-pill btn-pill-sm" :disabled="clawhubInstalling[item.slug] || isClawhubSkillInstalled(item)" @click.stop="installClawhubSkill(item.slug, item.version || '', item.repo_url || '')">
+                        <button class="btn-pill btn-pill-sm" :disabled="clawhubInstalling[item.slug] || isClawhubSkillInstalled(item)" @click.stop="installClawhubSkill(item.slug, (item.version && item.version !== 'None') ? item.version : '', item.repo_url || '')">
                           {{ isClawhubSkillInstalled(item) ? '已安装' : (clawhubInstalling[item.slug] ? '安装中…' : '安装') }}
                         </button>
                       </div>
@@ -2839,12 +2839,12 @@ createApp({
             </div>
             <div class="chip-row" style="margin-bottom:10px">
               <span class="chip chip-accent">{{ clawhubDetail.slug }}</span>
-              <span v-if="clawhubDetail.version" class="chip">v{{ clawhubDetail.version }}</span>
+              <span v-if="clawhubDetail.version && clawhubDetail.version !== 'None'" class="chip">v{{ clawhubDetail.version }}</span>
             </div>
             <div class="clawhub-links">
               <a class="btn-outline" :href="clawhubDetail.detail_url" target="_blank" rel="noopener noreferrer">打开技能页</a>
               <a v-if="clawhubDetail.repo_url" class="btn-outline" :href="clawhubDetail.repo_url" target="_blank" rel="noopener noreferrer">打开源码仓库</a>
-              <button class="btn-pill btn-pill-sm" :disabled="clawhubInstalling[clawhubDetail.slug] || isClawhubSkillInstalled(clawhubDetail)" @click="installClawhubSkill(clawhubDetail.slug, clawhubDetail.version || '', clawhubDetail.repo_url || '')">
+              <button class="btn-pill btn-pill-sm" :disabled="clawhubInstalling[clawhubDetail.slug] || isClawhubSkillInstalled(clawhubDetail)" @click="installClawhubSkill(clawhubDetail.slug, (clawhubDetail.version && clawhubDetail.version !== 'None') ? clawhubDetail.version : '', clawhubDetail.repo_url || '')">
                 {{ isClawhubSkillInstalled(clawhubDetail) ? '已安装' : (clawhubInstalling[clawhubDetail.slug] ? '安装中…' : '安装此技能') }}
               </button>
             </div>

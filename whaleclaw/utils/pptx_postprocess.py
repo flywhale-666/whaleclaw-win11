@@ -1,10 +1,11 @@
 """Post-processing for generated PPTX files.
 
 Fixes common issues that LLM-generated scripts leave behind:
-  1. Large opaque rectangles covering images (Z-order fix)
-  2. Images covering text boxes (Z-order fix)
-  3. Shapes overflowing the slide canvas (boundary clamp)
-  4. Image crops that cut off faces (face-aware re-crop)
+  1. Large opaque rectangles covering images (Z-order fix + transparency)
+  2. Full-screen opaque overlays on cover slides (remove or make translucent)
+  3. Images covering text boxes (Z-order fix)
+  4. Shapes overflowing the slide canvas (boundary clamp)
+  5. Image crops that cut off faces (face-aware re-crop)
 """
 
 from __future__ import annotations
@@ -14,9 +15,8 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-# Minimum area fraction to consider a rectangle "large"
 _LARGE_SHAPE_AREA_RATIO = 0.25
-
+_FULLSCREEN_AREA_RATIO = 0.70
 _RATIO_DIFF_THRESHOLD = 0.08
 
 
@@ -46,7 +46,7 @@ def fix_pptx(path: str | Path) -> bool:
     slide_area = sw * sh
     modified = False
 
-    for slide in prs.slides:
+    for slide_idx, slide in enumerate(prs.slides):
         sp_tree = slide.shapes._spTree  # type: ignore[attr-defined]
         children = list(sp_tree)
 
@@ -83,13 +83,34 @@ def fix_pptx(path: str | Path) -> bool:
                 )
                 if solid is None:
                     continue
+
+                has_text = _has_text_content(element)
+                el_rect = _get_xfrm_rect(element)
+                el_area = 0
+                if el_rect:
+                    el_area = (el_rect[2] - el_rect[0]) * (el_rect[3] - el_rect[1])
+
                 alpha_elem = solid.find(
                     "{http://schemas.openxmlformats.org/drawingml/2006/main}alpha"
                 )
+                current_alpha = 100000
                 if alpha_elem is not None:
-                    val = int(alpha_elem.get("val", "100000"))
-                    if val < 60000:
-                        continue
+                    current_alpha = int(alpha_elem.get("val", "100000"))
+
+                is_fullscreen = el_area >= slide_area * _FULLSCREEN_AREA_RATIO
+
+                if is_fullscreen and not has_text and current_alpha >= 60000:
+                    sp_tree.remove(element)
+                    modified = True
+                    continue
+
+                if is_fullscreen and has_text and current_alpha >= 80000:
+                    _set_shape_alpha(element, 55000)
+                    modified = True
+                    continue
+
+                if current_alpha < 60000:
+                    continue
 
                 sp_tree.remove(element)
                 insert_pos = 0
@@ -103,6 +124,8 @@ def fix_pptx(path: str | Path) -> bool:
                 modified = True
 
         if _fix_pictures_over_text(slide):
+            modified = True
+        if _fix_bars_over_pictures(slide):
             modified = True
         _clamp_shapes(slide, sw, sh)
         if _fix_face_crops(slide):
@@ -118,8 +141,28 @@ def fix_pptx(path: str | Path) -> bool:
     return modified
 
 
+def _set_shape_alpha(element: object, alpha_val: int) -> None:
+    """Set the alpha (transparency) on a shape's solidFill to *alpha_val* (0-100000)."""
+    from lxml import etree
+
+    ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    solid = element.find(f".//{{{ns}}}solidFill")  # type: ignore[union-attr]
+    if solid is None:
+        return
+    color_elem = None
+    for child in solid:
+        color_elem = child
+        break
+    if color_elem is None:
+        return
+    alpha_elem = color_elem.find(f"{{{ns}}}alpha")
+    if alpha_elem is None:
+        alpha_elem = etree.SubElement(color_elem, f"{{{ns}}}alpha")
+    alpha_elem.set("val", str(alpha_val))
+
+
 _A = "http://schemas.openxmlformats.org/drawingml/2006/main"
-_OVERLAP_THRESHOLD = 0.25
+_OVERLAP_THRESHOLD = 0.10
 
 
 def _get_xfrm_rect(
@@ -216,6 +259,64 @@ def _fix_pictures_over_text(slide: object) -> bool:
     for pic_el in pics_to_move:
         sp_tree.remove(pic_el)
         sp_tree.insert(first_content_pos, pic_el)
+        changed = True
+
+    return changed
+
+
+def _fix_bars_over_pictures(slide: object) -> bool:
+    """Move non-text rectangles/bars below pictures when they overlap.
+
+    Fixes the common issue where a top color bar is added after an image,
+    causing the bar to sit above the image and obscure it (e.g. cutting off
+    a person's head).
+    """
+    sp_tree = slide.shapes._spTree  # type: ignore[attr-defined]
+    children = list(sp_tree)
+    changed = False
+
+    pic_entries: list[tuple[int, object, tuple[int, int, int, int]]] = []
+    bar_entries: list[tuple[int, object, tuple[int, int, int, int]]] = []
+
+    for idx, child in enumerate(children):
+        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        rect = _get_xfrm_rect(child)
+        if rect is None:
+            continue
+        if tag == "pic":
+            pic_entries.append((idx, child, rect))
+        elif tag == "sp" and not _has_text_content(child):
+            solid = child.find(f".//{{{_A}}}solidFill")
+            if solid is not None:
+                bar_entries.append((idx, child, rect))
+
+    if not pic_entries or not bar_entries:
+        return False
+
+    bars_to_move: list[object] = []
+    for bar_idx, bar_el, bar_rect in bar_entries:
+        for pic_idx, _pic_el, pic_rect in pic_entries:
+            if bar_idx <= pic_idx:
+                continue
+            frac = _overlap_fraction(bar_rect, pic_rect)
+            if frac >= _OVERLAP_THRESHOLD:
+                bars_to_move.append(bar_el)
+                break
+
+    if not bars_to_move:
+        return False
+
+    first_content_pos = 0
+    for i, ch in enumerate(sp_tree):
+        ch_tag = ch.tag.split("}")[-1] if "}" in ch.tag else ch.tag
+        if ch_tag in ("cNvGrpSpPr", "grpSpPr", "nvGrpSpPr"):
+            first_content_pos = i + 1
+        else:
+            break
+
+    for bar_el in bars_to_move:
+        sp_tree.remove(bar_el)
+        sp_tree.insert(first_content_pos, bar_el)
         changed = True
 
     return changed

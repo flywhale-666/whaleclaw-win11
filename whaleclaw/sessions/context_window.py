@@ -1,22 +1,34 @@
 """Context window management with fixed-token hierarchical compression.
 
 Policy (user-defined):
-- Keep the latest 5 conversation groups unchanged.
-- Groups ranked from 6th to 12th latest use L1 compression.
-- Groups ranked from 13th to 25th latest use L0 compression.
-- Target total input budget is ~1600 tokens (best effort).
+- Current execution round (last group: user + assistant tool_calls + tool results)
+  is never trimmed; no token limit on the round being executed.
+- History only: keep the latest 4 conversation groups (excluding current round)
+  under budget; groups ranked 6th–12th use L1 compression; 13th+ use L0.
+- Target total input budget for history is ~1600 tokens (best effort).
 - If still over budget after physical truncation, compact dropped range into
   a single summary message and feed it back.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from whaleclaw.providers.base import Message
 
 if TYPE_CHECKING:
     from whaleclaw.sessions.store import SummaryRow
+
+
+@dataclass(frozen=True, slots=True)
+class TrimResult:
+    """Metadata about a context-window trim operation."""
+
+    messages: list[Message]
+    was_trimmed: bool
+    original_count: int
+    dropped_count: int
 
 MODEL_MAX_CONTEXT: dict[str, int] = {
     "claude-sonnet-4-20250514": 200_000,
@@ -324,6 +336,29 @@ class ContextWindow:
         del model
         return self._trim_core(messages, summaries=summaries)
 
+    def trim_with_metadata(
+        self,
+        messages: list[Message],
+        model: str,
+        summaries: list[SummaryRow] | None = None,
+    ) -> TrimResult:
+        """Trim and return metadata about what was dropped."""
+        non_system_count = sum(1 for m in messages if m.role != "system")
+        trimmed = self._trim_core(messages, summaries=summaries or [])
+        trimmed_non_system = sum(1 for m in trimmed if m.role != "system")
+        compacted = sum(
+            1 for m in trimmed
+            if m.role == "system" and m.content.startswith("[历史压缩摘要]")
+        )
+        kept = trimmed_non_system - compacted
+        dropped = max(0, non_system_count - kept)
+        return TrimResult(
+            messages=trimmed,
+            was_trimmed=dropped > 0,
+            original_count=non_system_count,
+            dropped_count=dropped,
+        )
+
     def _trim_core(
         self,
         messages: list[Message],
@@ -348,6 +383,9 @@ class ContextWindow:
         groups = _group_by_turn(non_system)
         recent_n = min(RECENT_PROTECTED, len(groups))
         recent_groups = list(groups[-recent_n:])
+        # 当前执行轮（最后一组：本轮 user + assistant tool_calls + tool results）不做 token 限制，完整保留
+        current_round_group = recent_groups[-1:] if recent_groups else []
+        recent_history_groups = recent_groups[:-1] if len(recent_groups) > 1 else []
 
         middle_end = max(0, len(groups) - recent_n)
         middle_start = max(0, middle_end - _L1_WINDOW)
@@ -358,8 +396,9 @@ class ContextWindow:
         middle_c_groups = [_compress_group(g, level="L1") for g in middle_groups]
         core_groups = [*old_c_groups, *middle_c_groups]
 
+        # 仅对“历史”应用预算；当前执行轮不参与 budget
         recent_kept_groups, recent_dropped_groups = _keep_recent_groups_with_budget(
-            recent_groups, non_budget
+            recent_history_groups, non_budget
         )
         recent_kept = _flatten_groups(recent_kept_groups)
         used = _total_tokens(recent_kept)
@@ -378,13 +417,17 @@ class ContextWindow:
         dropped_groups = [*core_groups[:dropped_group_count], *recent_dropped_groups]
         dropped = _flatten_groups(dropped_groups)
 
-        trimmed = [*core_kept, *recent_kept]
+        current_round_flat = _flatten_groups(current_round_group)
+        trimmed = [*core_kept, *recent_kept, *current_round_flat]
 
-        headroom = non_budget - _total_tokens(trimmed)
+        # 仅对历史部分计算 headroom；当前轮不占 budget
+        history_tokens = _total_tokens(core_kept) + _total_tokens(recent_kept)
+        headroom = non_budget - history_tokens
         compact_budget = min(220, max(0, headroom))
+        protected_tail_len = len(recent_kept) + len(current_round_flat)
         if dropped and compact_budget < 80:
             target = 120
-            while compact_budget < target and len(trimmed) > len(recent_kept):
+            while compact_budget < target and len(trimmed) > protected_tail_len:
                 removed = trimmed.pop(0)
                 compact_budget += _estimate_tokens(removed.content)
             compact_budget = min(220, compact_budget)
@@ -398,8 +441,9 @@ class ContextWindow:
         if compacted is not None:
             trimmed = [compacted, *trimmed]
 
-        while _total_tokens(trimmed) > non_budget and len(trimmed) > len(recent_kept):
-            if has_compacted and len(trimmed) > len(recent_kept) + 1:
+        # 只从头部删减历史，不触碰当前执行轮
+        while _total_tokens(trimmed) > non_budget and len(trimmed) > protected_tail_len:
+            if has_compacted and len(trimmed) > protected_tail_len + 1:
                 trimmed.pop(1)
                 continue
             trimmed.pop(0)

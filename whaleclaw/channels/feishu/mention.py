@@ -18,12 +18,13 @@ class MentionTarget(BaseModel):
 
 def extract_mention_targets(message: dict[str, Any]) -> list[MentionTarget]:
     """Extract @mention targets from a Feishu message event."""
-    mentions = message.get("mentions") or []
+    raw_mentions: list[dict[str, Any]] = message.get("mentions") or []
     targets: list[MentionTarget] = []
-    for m in mentions:
-        key = m.get("key", "")
-        user_id = m.get("id", {}).get("open_id", "") or m.get("id", {}).get("user_id", "")
-        name = m.get("name", key)
+    for m in raw_mentions:
+        key: str = m.get("key", "")
+        id_obj: dict[str, str] = m.get("id", {})
+        user_id: str = id_obj.get("open_id", "") or id_obj.get("user_id", "")
+        name: str = m.get("name", key)
         if user_id:
             targets.append(MentionTarget(user_id=user_id, name=name))
     return targets

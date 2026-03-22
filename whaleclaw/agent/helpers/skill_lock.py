@@ -21,11 +21,12 @@ CORE_NATIVE_TOOLS = {
     "ppt_edit",
     "docx_edit",
     "xlsx_edit",
+    "reminder",
 }
 _NANO_BANANA_DEFAULT_MODEL_FILE = (
     Path.home() / ".whaleclaw" / "credentials" / "nano_banana_default_model.txt"
 )
-MAX_NATIVE_TOOLS = 12
+MAX_NATIVE_TOOLS = 16
 TOOL_POLICY_KEYWORDS: dict[tuple[str, ...], tuple[str, ...]] = {
     ("ppt", "pptx", "幻灯片", "演示文稿"): ("ppt_edit", "file_edit", "patch_apply"),
     ("word", "docx", "文档"): ("docx_edit", "file_edit"),
@@ -33,6 +34,7 @@ TOOL_POLICY_KEYWORDS: dict[tuple[str, ...], tuple[str, ...]] = {
     ("网页", "网站", "页面", "链接", "url"): ("browser", "web_fetch"),
     ("代码", "脚本", "终端", "命令", "日志"): ("bash", "file_read", "file_write"),
     ("进程", "后台", "卡住", "kill", "日志"): ("process", "bash"),
+    ("定时", "提醒", "闹钟", "分钟后", "小时后", "cron", "reminder"): ("reminder", "cron"),
 }
 
 
@@ -183,8 +185,13 @@ def build_nano_banana_execution_system_message(
         '3) 若用户是在说\u201c重试\u201d\u201c继续处理这张图\u201d\u201c改用香蕉pro重试\u201d这类续跑语义，且没有上传新图，'
         "默认复用最近一轮可用图片，不要再要求用户重新上传。\n"
         f"4) 当前可直接复用的历史图片绝对路径如下：\n{image_lines}\n"
-        "5) 禁止使用 bash 做环境探测或计划回读，例如 `Test-Path`、`Get-Content`、"
-        "`ls/stat/test`、读取 `task-plan.md` 等；需要生图时直接执行推荐命令。"
+        "5) 禁止做任何脚本/环境探测或计划回读；不要调用 `file_read`/`file_write`/"
+        "`file_edit`/`patch_apply` 去查看或改写脚本，也不要用 bash 执行 "
+        "`Test-Path`、`Get-Content`、`ls/stat/test`、读取 `task-plan.md` 等；"
+        "需要生图时直接执行推荐命令。\n"
+        "6) 回复格式要求：回复要简洁紧凑，不要有多余空行；"
+        "不要在回复中展示文件保存路径或命令细节；"
+        '不要自行追加\u201c回复任务完成以解除技能锁定\u201d之类的提示（系统会自动追加）。'
         f"{cmd_hint}"
     )
     return Message(role="system", content=body)
@@ -321,12 +328,15 @@ def has_param_secret_source(param: SkillParamItem) -> bool:
     return False
 
 
+_API_KEY_PREFIXES = ("sk-", "tvly-")
+
+
 def persist_param_secret(param: SkillParamItem, value: object) -> None:
     """Persist a captured secret value into the configured saved file."""
     if param.type.strip().lower() != "api_key" or not param.saved_file:
         return
     secret = str(value).strip() if isinstance(value, str) else ""
-    if not secret.startswith("sk-"):
+    if not any(secret.startswith(prefix) for prefix in _API_KEY_PREFIXES):
         return
     path = Path(param.saved_file).expanduser()
     try:
@@ -351,12 +361,12 @@ def capture_param_value(
         value = extract_ratio_or_size(text) or extract_value_by_aliases(text, aliases)
         return value or previous
     if param_type == "api_key":
-        direct_match = re.search(r"\b(sk-[A-Za-z0-9_-]{12,})\b", text)
+        direct_match = re.search(r"\b((?:sk|tvly)-[A-Za-z0-9_-]{12,})\b", text)
         if direct_match:
             return direct_match.group(1)
         alias_val = extract_value_by_aliases(text, aliases)
-        if alias_val and "sk-" in alias_val.lower():
-            alias_match = re.search(r"\b(sk-[A-Za-z0-9_-]{12,})\b", alias_val)
+        if alias_val and re.search(r"(?:sk|tvly)-", alias_val, re.IGNORECASE):
+            alias_match = re.search(r"\b((?:sk|tvly)-[A-Za-z0-9_-]{12,})\b", alias_val)
             if alias_match:
                 return alias_match.group(1)
         if has_param_secret_source(param):
@@ -373,9 +383,17 @@ def capture_param_value(
             and not stripped.startswith("/use ")
             and "技能" not in stripped
         ):
-            if re.search(r"\bsk-[A-Za-z0-9_-]{12,}\b", stripped):
+            if re.search(r"\b(?:sk|tvly)-[A-Za-z0-9_-]{12,}\b", stripped):
                 return previous
-            if any(token in stripped for token in ("api key", "apikey", "尺寸", "比例")):
+            candidate_lower = stripped.lower()
+            if any(
+                token in candidate_lower
+                for token in ("api key", "apikey", "api_key")
+            ):
+                return previous
+            if len(stripped) <= 20 and any(
+                token in candidate_lower for token in ("尺寸", "比例")
+            ):
                 return previous
             return stripped
     return previous
@@ -483,11 +501,6 @@ def is_nano_banana_control_message(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return False
-    normalized = _normalized_compact(stripped)
-    if any(prefix in normalized for prefix in _NANO_BANANA_CONTROL_PREFIXES) and any(
-        token in normalized for token in ("香蕉2", "香蕉pro")
-    ):
-        return True
     return any(pattern.fullmatch(stripped) for pattern in _NANO_BANANA_CONTROL_MESSAGE_PATTERNS)
 
 
@@ -554,16 +567,20 @@ def _build_nano_banana_param_guard_reply(state: dict[str, object]) -> str:
         ),
         state.get("images"),
     )
+
+    has_key = param_satisfied(SkillParamItem(key="api_key", type="api_key"), state.get("api_key"))
+    has_prompt = param_satisfied(SkillParamItem(key="prompt", type="text"), prompt_value)
+
+    if state.get("__api_key_just_saved__"):
+        return "API Key 已保存。"
+
     lines = [
         "我将使用 nano-banana-image-t8 技能继续完成任务。",
         "",
         "我先确认参数（缺啥补啥）：",
         (
             "1) API Key：已就绪"
-            if param_satisfied(
-                SkillParamItem(key="api_key", type="api_key"),
-                state.get("api_key"),
-            )
+            if has_key
             else "1) API Key：未提供"
         ),
         model_line,
@@ -572,9 +589,9 @@ def _build_nano_banana_param_guard_reply(state: dict[str, object]) -> str:
         "5) 切换本次模型：切换香蕉2（pro）。设置默认模型：默认模型香蕉2（pro）",
     ]
     missing_prompts: list[str] = []
-    if not param_satisfied(SkillParamItem(key="api_key", type="api_key"), state.get("api_key")):
+    if not has_key:
         missing_prompts.append("请提供 Nano Banana API Key")
-    if not param_satisfied(SkillParamItem(key="prompt", type="text"), prompt_value):
+    if not has_prompt:
         missing_prompts.append("请提供提示词")
     # Images are optional (required=False); only required for image-to-image which is
     # determined at execution time, not at the param-guard stage.
@@ -591,6 +608,8 @@ def nano_banana_missing_required(
     control_message_only: bool,
 ) -> bool:
     """Decide whether Nano Banana should stay in the fixed parameter-guard stage."""
+    if state.get("__api_key_just_saved__"):
+        return True
     has_key = param_satisfied(SkillParamItem(key="api_key", type="api_key"), state.get("api_key"))
     prompt_value = sanitize_nano_banana_prompt_value(state.get("prompt"))
     has_prompt = param_satisfied(SkillParamItem(key="prompt", type="text"), prompt_value)
@@ -605,7 +624,16 @@ def build_skill_param_guard_reply(
     skill_id: str,
     params: list[SkillParamItem],
     state: dict[str, object],
+    *,
+    skill: Skill | None = None,
 ) -> str:
+    if skill is not None:
+        from whaleclaw.skills.hooks import get_skill_hooks
+
+        hooks = get_skill_hooks(skill)
+        if hooks is not None:
+            return hooks.build_param_guard_reply(state)
+
     if skill_id == "nano-banana-image-t8":
         return _build_nano_banana_param_guard_reply(state)
 
@@ -631,6 +659,7 @@ def update_guard_state(
     images: list[ImageContent] | None,
 ) -> tuple[dict[str, object], bool]:
     new_state = dict(state)
+    _user_sent_key = bool(re.search(r"\b(?:sk|tvly)-[A-Za-z0-9_-]{12,}\b", message))
     missing_required = False
     for param in params:
         prev = new_state.get(param.key)
@@ -639,6 +668,10 @@ def update_guard_state(
         persist_param_secret(param, captured)
         if param.required and not param_satisfied(param, captured):
             missing_required = True
+    if _user_sent_key:
+        new_state["__api_key_just_saved__"] = True
+    else:
+        new_state.pop("__api_key_just_saved__", None)
     return new_state, missing_required
 
 

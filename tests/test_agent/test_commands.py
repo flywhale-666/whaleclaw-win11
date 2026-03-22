@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import AsyncGenerator
+
 import pytest
 
 from whaleclaw.agent.commands import ChatCommand
 from whaleclaw.config.schema import WhaleclawConfig
-from whaleclaw.sessions.manager import SessionManager
+from whaleclaw.sessions.manager import Session, SessionManager
 from whaleclaw.sessions.store import SessionStore
 
 
 @pytest.fixture()
-async def cmd(tmp_path):  # noqa: ANN001
+async def cmd(tmp_path: Path) -> AsyncGenerator[tuple[ChatCommand, Session], None]:
     store = SessionStore(db_path=tmp_path / "test.db")
     await store.open()
     mgr = SessionManager(store, WhaleclawConfig())
@@ -21,13 +24,13 @@ async def cmd(tmp_path):  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_not_a_command(cmd) -> None:  # noqa: ANN001
+async def test_not_a_command(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     assert await chat_cmd.handle("hello", session) is None
 
 
 @pytest.mark.asyncio
-async def test_help(cmd) -> None:  # noqa: ANN001
+async def test_help(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/help", session)
     assert result is not None
@@ -35,7 +38,7 @@ async def test_help(cmd) -> None:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_status(cmd) -> None:  # noqa: ANN001
+async def test_status(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/status", session)
     assert result is not None
@@ -43,7 +46,7 @@ async def test_status(cmd) -> None:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_model_switch(cmd) -> None:  # noqa: ANN001
+async def test_model_switch(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/model openai/gpt-5.2", session)
     assert result is not None
@@ -52,7 +55,7 @@ async def test_model_switch(cmd) -> None:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_model_no_arg(cmd) -> None:  # noqa: ANN001
+async def test_model_no_arg(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/model", session)
     assert result is not None
@@ -60,7 +63,7 @@ async def test_model_no_arg(cmd) -> None:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_think(cmd) -> None:  # noqa: ANN001
+async def test_think(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/think high", session)
     assert result is not None
@@ -69,7 +72,7 @@ async def test_think(cmd) -> None:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_think_invalid(cmd) -> None:  # noqa: ANN001
+async def test_think_invalid(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/think banana", session)
     assert result is not None
@@ -77,7 +80,7 @@ async def test_think_invalid(cmd) -> None:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_reset(cmd) -> None:  # noqa: ANN001
+async def test_reset(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/new", session)
     assert result is not None
@@ -85,7 +88,7 @@ async def test_reset(cmd) -> None:  # noqa: ANN001
 
 
 @pytest.mark.asyncio
-async def test_unknown_command(cmd) -> None:  # noqa: ANN001
+async def test_unknown_command(cmd: tuple[ChatCommand, Session]) -> None:
     chat_cmd, session = cmd
     result = await chat_cmd.handle("/foobar", session)
     assert result is not None

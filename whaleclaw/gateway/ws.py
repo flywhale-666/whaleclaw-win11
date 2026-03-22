@@ -25,6 +25,7 @@ from whaleclaw.config.schema import WhaleclawConfig
 from whaleclaw.gateway.protocol import (
     MessageType,
     WSMessage,
+    make_agent_done,
     make_error,
     make_message,
     make_pong,
@@ -501,6 +502,25 @@ async def websocket_handler(
             await session_manager.add_message(_session, "assistant", round_msg)
             await _safe_send(websocket, make_message(_sid, round_msg))
 
+        async def on_done_cb(
+            model: str,
+            input_tokens: int,
+            output_tokens: int,
+            llm_rounds: int,
+            _sid: str = sid,
+        ) -> None:
+            if ws_alive_fn():
+                await _safe_send(
+                    websocket,
+                    make_agent_done(
+                        _sid,
+                        model=model,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        llm_rounds=llm_rounds,
+                    ),
+                )
+
         async def _clear_self_heal_retries() -> None:
             if _SELF_HEAL_RETRY_KEY not in session.metadata:
                 return
@@ -603,6 +623,7 @@ async def websocket_handler(
                 on_tool_call=on_tool_call_cb,
                 on_tool_result=on_tool_result_cb,
                 on_round_result=on_round_result_cb,
+                on_done=on_done_cb,
                 images=images or None,
                 session_manager=session_manager,
                 session_store=session_store,
@@ -700,6 +721,23 @@ async def websocket_handler(
                 if entry:
                     await entry.emit(make_message(sid, round_msg))
 
+            async def on_done_bg(
+                model: str,
+                input_tokens: int,
+                output_tokens: int,
+                llm_rounds: int,
+            ) -> None:
+                if entry:
+                    await entry.emit(
+                        make_agent_done(
+                            sid,
+                            model=model,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            llm_rounds=llm_rounds,
+                        ),
+                    )
+
             try:
                 reply = await run_agent(
                     message=content or "(用户发送了图片)",
@@ -712,6 +750,7 @@ async def websocket_handler(
                     on_tool_call=on_tool_call_bg,
                     on_tool_result=on_tool_result_bg,
                     on_round_result=on_round_result_bg,
+                    on_done=on_done_bg,
                     images=images or None,
                     session_manager=session_manager,
                     session_store=session_store,

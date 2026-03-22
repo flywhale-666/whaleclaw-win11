@@ -1,4 +1,20 @@
-"""Tool guard helpers for the single-agent runtime."""
+"""Tool guard helpers for the single-agent runtime.
+
+熔断策略由此模块统一管理，采用三类独立守卫并行运行的架构，输出统一的
+GuardDecision 决策结构。
+
+决策类型（GuardDecision.level）：
+- warn：警告，注入提示要求改变策略
+- block：熔断，将工具加入 blocked_tools，禁止后续调用
+- abort：终止当前路径，设置 stop_for_repeat_loop / stop_for_probe_loop
+- hint：提示，注入一次性建议（如超时后增大 timeout）
+
+守卫分工：
+- FailureGuard：工具连续失败熔断（browser / bash），在 apply_tool_result_guards 中实现
+- LoopGuard：重复路径检测（精确/模糊签名），在 apply_post_round_guards 中实现
+- DomainGuard：业务预算约束（search_images 额度与重复搜索词），在 apply_tool_result_guards
+  与 apply_post_round_guards 中实现
+"""
 
 from __future__ import annotations
 
@@ -22,6 +38,19 @@ class GuardLogEvent:
     level: Literal["info", "warning"]
     event: str
     fields: dict[str, object] = field(default_factory=dict)
+
+
+GuardDecisionLevel = Literal["warn", "block", "abort", "hint"]
+
+
+@dataclass(slots=True)
+class GuardDecision:
+    """单条熔断决策：warn / block / abort / hint。"""
+
+    level: GuardDecisionLevel
+    message: str
+    tool: str | None = None
+    log_event: GuardLogEvent | None = None
 
 
 @dataclass(slots=True)
@@ -54,6 +83,7 @@ class ToolGuardState:
     last_failed_bash_signature: str = ""
     blocked_tools: set[str] = field(default_factory=set)
     low_value_bash_probe_streak: int = 0
+    cdp_mode: bool = False
 
 
 def is_low_value_bash_probe(tc: ToolCall) -> bool:
@@ -94,6 +124,14 @@ _NANO_BANANA_BASH_RE = re.compile(
 def is_nano_banana_bash_command(command: str) -> bool:
     """Return True if the bash command is a nano-banana image generation command."""
     return bool(_NANO_BANANA_BASH_RE.search(command))
+
+
+def is_bash_timeout_result(result: ToolResult) -> bool:
+    """Return True if the bash tool result indicates command timeout."""
+    if result.success or not result.error:
+        return False
+    raw = result.error
+    return "超时" in raw or "timeout" in raw.lower()
 
 
 _BASH_NOISE_RE = re.compile(
@@ -219,6 +257,7 @@ def apply_tool_result_guards(
     office_loop_guard_enabled: bool,
     image_api_probe_guard_enabled: bool,
     session_id: str | None,
+    skill_hooks: object | None = None,
 ) -> ToolGuardUpdate:
     update = ToolGuardUpdate()
 
@@ -239,24 +278,39 @@ def apply_tool_result_guards(
             state.browser_fail_streak = 0
         else:
             state.browser_fail_streak += 1
+            # FailureGuard — Browser: 警告 2 次，熔断 3 次
             if state.browser_fail_streak >= 2 and "browser" not in state.blocked_tools:
-                state.blocked_tools.add("browser")
-                update.log_events.append(
-                    GuardLogEvent(
-                        level="warning",
-                        event="agent.tool_circuit_open",
-                        fields={
-                            "tool": "browser",
-                            "fail_streak": state.browser_fail_streak,
-                            "session_id": session_id or "",
-                        },
+                if state.browser_fail_streak == 2:
+                    # warn
+                    if state.cdp_mode:
+                        update.conversation_messages.append(
+                            "[browser 提示] 操作失败，请先 screenshot 截图确认页面状态，"
+                            "再根据截图内容选择正确的选择器重试；若再失败将熔断。"
+                        )
+                    else:
+                        update.conversation_messages.append(
+                            "[系统提示] browser 已连续失败 2 次，请检查调用方式；"
+                            "若再失败将熔断，请改用 bash 完成可复现操作。"
+                        )
+                if state.browser_fail_streak >= 3:
+                    # block
+                    state.blocked_tools.add("browser")
+                    update.log_events.append(
+                        GuardLogEvent(
+                            level="warning",
+                            event="agent.tool_circuit_open",
+                            fields={
+                                "tool": "browser",
+                                "fail_streak": state.browser_fail_streak,
+                                "session_id": session_id or "",
+                            },
+                        )
                     )
-                )
-                update.conversation_messages.append(
-                    "[系统降级] browser 工具连续失败，已自动熔断。"
-                    "后续请不要再调用 browser。"
-                    "请改用 bash 工具执行可复现的命令行方案完成任务。"
-                )
+                    update.conversation_messages.append(
+                        "[系统降级] browser 工具连续失败，已自动熔断。"
+                        "后续请不要再调用 browser。"
+                        "请改用 bash 工具执行可复现的命令行方案完成任务。"
+                    )
 
     if tc.name == "bash":
         if result.success:
@@ -265,8 +319,24 @@ def apply_tool_result_guards(
             state.last_failed_bash_signature = ""
         else:
             raw_command = str(tc.arguments.get("command", ""))
-            # nano-banana 生图命令失败：任何原因一律禁止重试，继续执行剩余任务
-            if is_nano_banana_bash_command(raw_command):
+            # Skill hooks: check if any active skill wants to handle this failure
+            if skill_hooks is not None:
+                hook_messages = skill_hooks.on_tool_failure(tc, result)
+                if hook_messages:
+                    update.log_events.append(
+                        GuardLogEvent(
+                            level="warning",
+                            event="agent.skill_hook_tool_failure",
+                            fields={
+                                "session_id": session_id or "",
+                                "error": (result.error or "")[:200],
+                            },
+                        )
+                    )
+                    update.conversation_messages.extend(hook_messages)
+                    return update
+            # Legacy fallback: Nano Banana 生图豁免
+            elif is_nano_banana_bash_command(raw_command):
                 update.log_events.append(
                     GuardLogEvent(
                         level="warning",
@@ -279,10 +349,10 @@ def apply_tool_result_guards(
                 )
                 update.conversation_messages.append(
                     "[系统提示] 本次生图失败，禁止自动重试。"
+                    "若为参数或预检错误，可修正后重试 1 次；禁止原样重试。"
                     "请继续执行剩余的生图任务（如用户要求生成多张图，跳过本张继续生成后续图片）。"
                     "所有任务完成后，将成功和失败的结果一并回复用户，由用户决定是否对失败的图重新操作。"
                 )
-                # nano-banana 失败不计入通用 bash 失败熔断计数
                 return update
 
             state.bash_fail_streak += 1
@@ -295,6 +365,12 @@ def apply_tool_result_guards(
             else:
                 state.same_failed_bash_streak = 0
                 state.last_failed_bash_signature = ""
+            # FailureGuard — Bash: 警告 2 次，熔断 3 次（同一命令模板）
+            if state.same_failed_bash_streak == 2 and "bash" not in state.blocked_tools:
+                update.conversation_messages.append(
+                    "[系统提示] 同一 bash 命令模板已连续失败 2 次，请换方案或修改参数；"
+                    "若再失败将熔断 bash，请改用结构化编辑或文件工具。"
+                )
             if state.same_failed_bash_streak >= 3 and "bash" not in state.blocked_tools:
                 state.blocked_tools.add("bash")
                 update.log_events.append(
@@ -316,6 +392,11 @@ def apply_tool_result_guards(
                     "后续请不要再调用 bash。"
                     "请改用结构化编辑工具（ppt_edit/docx_edit/xlsx_edit）"
                     "或文件工具（file_read/file_write/file_edit）继续。"
+                )
+            # 超时特殊处理：hint，提醒增大 timeout，禁止不改参数直接重试
+            if is_bash_timeout_result(result):
+                update.conversation_messages.append(
+                    "[系统提示] 命令超时。请增大 timeout 参数后重试，禁止不改参数直接重试。"
                 )
 
     if (office_loop_guard_enabled or image_api_probe_guard_enabled) and is_low_value_bash_probe(tc):
@@ -507,12 +588,15 @@ def apply_post_round_guards(
 
 
 __all__ = [
+    "GuardDecision",
+    "GuardDecisionLevel",
     "GuardLogEvent",
     "ToolGuardState",
     "ToolGuardUpdate",
     "apply_post_round_guards",
     "apply_tool_result_guards",
     "blocked_tool_reasons",
+    "is_bash_timeout_result",
     "is_low_value_bash_probe",
     "is_nano_banana_bash_command",
     "is_progress_stage_tool_call",

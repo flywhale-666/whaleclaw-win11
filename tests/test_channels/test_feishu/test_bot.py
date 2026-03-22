@@ -18,12 +18,29 @@ from whaleclaw.config.schema import ProviderModelEntry, WhaleclawConfig
 class _StubClient:
     def __init__(self) -> None:
         self.replies: list[tuple[str, str, str]] = []
+        self.reactions_created: list[tuple[str, str]] = []
+        self.reactions_deleted: list[tuple[str, str]] = []
+        self._reaction_counter = 0
 
     async def reply_message(  # noqa: D401
         self, message_id: str, msg_type: str, content: str
     ) -> dict[str, Any]:
         self.replies.append((message_id, msg_type, content))
         return {"data": {"message_id": "reply-1"}}
+
+    async def create_reaction(
+        self, message_id: str, emoji_type: str = "EYES"
+    ) -> str:
+        self._reaction_counter += 1
+        reaction_id = f"reaction-{self._reaction_counter}"
+        self.reactions_created.append((message_id, emoji_type))
+        return reaction_id
+
+    async def delete_reaction(
+        self, message_id: str, reaction_id: str
+    ) -> dict[str, Any]:
+        self.reactions_deleted.append((message_id, reaction_id))
+        return {"code": 0}
 
     async def download_resource(
         self, message_id: str, file_key: str, *, resource_type: str = "file"
@@ -237,6 +254,7 @@ async def test_handle_image_message_passes_images_to_agent(monkeypatch: pytest.M
         card_msg_id: str,
         *,
         images: list[Any] | None = None,
+        reaction_id: str = "",
     ) -> None:
         captured["text"] = text
         captured["peer_id"] = peer_id
@@ -272,7 +290,9 @@ async def test_handle_image_message_buffers_until_submit(
 ) -> None:
     client = _StubClient()
     bot = FeishuBot(client, FeishuConfig(dm_policy="open"))
-    bot._session_manager = _StubSessionManager()  # noqa: SLF001
+    sm = _StubSessionManager()
+    sm.session.metadata = {"locked_skill_ids": ["nano-banana-image-t8"]}
+    bot._session_manager = sm  # noqa: SLF001
     media_dir = Path("/tmp/whaleclaw-test-feishu-buffer")
     captured: dict[str, Any] = {}
 
@@ -282,6 +302,7 @@ async def test_handle_image_message_buffers_until_submit(
         card_msg_id: str,
         *,
         images: list[Any] | None = None,
+        reaction_id: str = "",
     ) -> None:
         captured["text"] = text
         captured["peer_id"] = peer_id
@@ -314,7 +335,8 @@ async def test_handle_image_message_buffers_until_submit(
         },
     })
 
-    assert "收到，处理中" in client.replies[-1][2]
+    assert any(mid == "msg-buffer-2" for mid, _ in client.reactions_created)
+    assert not any("收到，处理中" in c for _, _, c in client.replies)
     assert captured["peer_id"] == "ou_xxx"
     assert captured["text"].startswith("让图1的男孩骑马")
     assert "![飞书图片1](" in captured["text"]
@@ -337,6 +359,7 @@ async def test_handle_images_with_prompt_runs_immediately_without_submit(
         card_msg_id: str,
         *,
         images: list[Any] | None = None,
+        reaction_id: str = "",
     ) -> None:
         captured["text"] = text
         captured["peer_id"] = peer_id
@@ -356,14 +379,17 @@ async def test_handle_images_with_prompt_runs_immediately_without_submit(
                 "content": [
                     [
                         {"tag": "text", "text": "让图1的男孩骑着图2的马"},
+                        {"tag": "img", "image_key": "img_key_1"},
+                        {"tag": "img", "image_key": "img_key_2"},
+                        {"tag": "img", "image_key": "img_key_3"},
                     ]
                 ],
-                "image_keys": ["img_key_1", "img_key_2", "img_key_3"],
             }),
         },
     })
 
-    assert "收到，处理中" in client.replies[-1][2]
+    assert any(mid == "msg-direct-run-1" for mid, _ in client.reactions_created)
+    assert not any("收到，处理中" in c for _, _, c in client.replies)
     assert captured["peer_id"] == "ou_xxx"
     assert captured["text"].startswith("让图1的男孩骑着图2的马")
     assert captured["text"].count("![飞书图片") == 3
@@ -376,7 +402,9 @@ async def test_handle_buffered_images_then_prompt_runs_immediately_without_submi
 ) -> None:
     client = _StubClient()
     bot = FeishuBot(client, FeishuConfig(dm_policy="open"))
-    bot._session_manager = _StubSessionManager()  # noqa: SLF001
+    sm = _StubSessionManager()
+    sm.session.metadata = {"locked_skill_ids": ["nano-banana-image-t8"]}
+    bot._session_manager = sm  # noqa: SLF001
     media_dir = Path("/tmp/whaleclaw-test-feishu-buffer-then-run")
     captured: dict[str, Any] = {}
 
@@ -386,6 +414,7 @@ async def test_handle_buffered_images_then_prompt_runs_immediately_without_submi
         card_msg_id: str,
         *,
         images: list[Any] | None = None,
+        reaction_id: str = "",
     ) -> None:
         captured["text"] = text
         captured["peer_id"] = peer_id
@@ -427,7 +456,8 @@ async def test_handle_buffered_images_then_prompt_runs_immediately_without_submi
         },
     })
 
-    assert "收到，处理中" in client.replies[-1][2]
+    assert any(mid == "msg-buffer-run-3" for mid, _ in client.reactions_created)
+    assert not any("收到，处理中" in c for _, _, c in client.replies)
     assert captured["peer_id"] == "ou_xxx"
     assert captured["text"].startswith("图2的巨型三花猫正好奇地拨弄着图1的寺庙")
     assert captured["text"].count("![飞书图片") == 2

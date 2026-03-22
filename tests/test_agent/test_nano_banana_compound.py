@@ -68,6 +68,6 @@ async def test_compound_task_injects_nano_banana_execution_hint(monkeypatch: pyt
     assert result == "ok"
     system_text = "\n".join(msg.content for msg in router.messages if msg.role == "system")
     assert "当前正在执行 nano-banana-image-t8 技能。" in system_text
-    assert "禁止使用 bash 做环境探测或计划回读" in system_text
+    assert "禁止做任何脚本/环境探测或计划回读" in system_text
     assert "推荐直接使用以下命令执行" in system_text
     assert "test_nano_banana_2.py" in system_text

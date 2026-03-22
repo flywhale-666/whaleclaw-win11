@@ -27,3 +27,25 @@ def custom_config() -> WhaleclawConfig:
 def _reset_global_config() -> None:
     """Ensure global config is reset between tests."""
     reset_config()
+
+
+@pytest.fixture(autouse=True)
+def _reset_skill_hooks_globals() -> None:
+    """Ensure skill hooks global state is reset between tests."""
+    from whaleclaw.agent.helpers import tool_execution
+    tool_execution._active_skill_hooks = None
+
+    from whaleclaw.skills import hooks as hooks_mod
+    hooks_mod._hooks_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_agent_module_patches() -> None:
+    """Restore agent module globals that manual MonkeyPatch may leak."""
+    import whaleclaw.agent.single_agent as sa
+
+    orig_execute_tool = sa._execute_tool
+    orig_route_skills = sa._assembler.route_skills
+    yield
+    sa._execute_tool = orig_execute_tool
+    sa._assembler.route_skills = orig_route_skills

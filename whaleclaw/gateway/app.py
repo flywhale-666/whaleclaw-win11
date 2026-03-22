@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import time
 from collections.abc import AsyncIterator
@@ -306,6 +307,28 @@ def _as_str_object_dict(value: object) -> dict[str, object]:
     return {str(key): item for key, item in raw.items() if isinstance(key, str)}
 
 
+_DEFERRED_TIME_PREFIX_RE = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"\d+\s*(?:分钟|小时|秒|min|hour|h)\s*(?:后|之后|以后)"
+    r"|"
+    r"(?:今天|明天|后天)?\s*(?:今晚|明早|早上|上午|中午|下午|晚上|凌晨|傍晚)?"
+    r"\s*\d{1,2}\s*[点时:：]\s*(?:半|\d{0,2})"
+    r"|"
+    r"每天\s*\d{1,2}[:\s点时]\d{0,2}"
+    r"|"
+    r"每隔?\s*\d+\s*分钟"
+    r")"
+    r"\s*[，,\s]*",
+)
+
+
+def _strip_deferred_time_prefix(text: str) -> str:
+    """Remove leading time-delay prefix so the agent sees only the core task."""
+    stripped = _DEFERRED_TIME_PREFIX_RE.sub("", text.strip()).strip()
+    return stripped if stripped else text.strip()
+
+
 def create_app(config: WhaleclawConfig) -> FastAPI:
     """Create and configure the FastAPI application."""
     from whaleclaw.mcp.manager import McpManager
@@ -315,32 +338,62 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
     async def _on_cron_fire(job_id: str, action: CronAction) -> None:
         if action.type == "agent":
-            # 以定时 agent 任务方式执行：直接调用 run_agent
             session_id = action.target
             task_text = action.payload.get("text", "")
             if not (session_id and task_text):
                 return
+            # Bug 7: strip time prefix to prevent the agent from re-interpreting
+            # the fired task as yet another deferred-task request (infinite loop).
+            task_text = _strip_deferred_time_prefix(str(task_text))
             mgr = state.get("manager")
             cfg_ref = state.get("config")
             router_ref = state.get("router")
             if not isinstance(mgr, SessionManager) or cfg_ref is None or router_ref is None:
+                log.warning(
+                    "cron.agent_task_skipped",
+                    job_id=job_id,
+                    reason="state not ready",
+                    has_manager=mgr is not None,
+                    has_config=cfg_ref is not None,
+                    has_router=router_ref is not None,
+                )
                 return
             from whaleclaw.agent.single_agent import run_agent as _run_agent
 
             try:
                 s = await mgr.get(session_id)
+                registry_ref = state.get("registry")
+                memory_ref = state.get("memory_manager")
+                compressor_ref = state.get("group_compressor")
                 reply = await _run_agent(
                     str(task_text),
                     session_id,
                     cfg_ref,  # type: ignore[arg-type]
                     session=s,
                     router=router_ref,  # type: ignore[arg-type]
+                    registry=registry_ref,  # type: ignore[arg-type]
                     session_manager=mgr,
+                    memory_manager=memory_ref,  # type: ignore[arg-type]
+                    group_compressor=compressor_ref,  # type: ignore[arg-type]
                 )
-                await push_to_session(session_id, make_message(session_id, reply))
+
+                sent = await push_to_session(session_id, make_message(session_id, reply))
+
+                if not sent:
+                    from whaleclaw.gateway.ws import broadcast_all
+                    await broadcast_all(make_message(session_id, reply))
+
+                if not sent and feishu_channel is not None:
+                    if s and s.channel == "feishu" and feishu_channel.client:
+                        await feishu_channel.client.send_message(
+                            s.peer_id,
+                            "text",
+                            json.dumps({"text": reply}, ensure_ascii=False),
+                        )
+
+                await mgr.add_message(s, "assistant", reply) if s else None
             except Exception as _exc:
-                import structlog as _slog
-                _slog.get_logger().warning("cron.agent_task_failed", job_id=job_id, error=str(_exc))
+                log.warning("cron.agent_task_failed", job_id=job_id, error=str(_exc))
             return
 
         if action.type == "message":
@@ -420,6 +473,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         await _load_plugins(config, registry, plugin_registry, hook_manager)
         state["registry"] = registry
+        state["config"] = config
+        state["router"] = ModelRouter(config.models)
 
         # --- MCP servers ---
         from whaleclaw.mcp.manager import McpManager
@@ -674,40 +729,39 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 stdout = proc.stdout.decode("utf-8", errors="replace")
                 if proc.returncode == 0 and stdout.strip():
                     import json as _json
-                    data = _json.loads(stdout)
+                    data: object = _json.loads(stdout)
                     mcporter_servers: list[dict[str, Any]] = []
                     if isinstance(data, list):
-                        mcporter_servers = data
+                        mcporter_servers = cast(list[dict[str, Any]], data)
                     elif isinstance(data, dict) and "servers" in data:
-                        mcporter_servers = data["servers"]
+                        mcporter_servers = cast(list[dict[str, Any]], data["servers"])
                     existing_ids = {s.get("id") for s in servers}
                     for ms in mcporter_servers:
                         sid = str(ms.get("id") or ms.get("name", "")).strip()
                         if not sid or sid in existing_ids:
                             continue
-                        tools = ms.get("tools", [])
-                        tool_names = (
-                            [str(t.get("name", "")) for t in tools]
-                            if isinstance(tools, list) and tools and isinstance(tools[0], dict)
-                            else [str(t) for t in tools] if isinstance(tools, list)
-                            else []
-                        )
+                        raw_tools: object = ms.get("tools", [])
+                        tool_names: list[str] = []
+                        if isinstance(raw_tools, list) and raw_tools and isinstance(raw_tools[0], dict):
+                            typed_tools = cast(list[dict[str, Any]], raw_tools)
+                            tool_names = [str(t.get("name", "")) for t in typed_tools]
+                        elif isinstance(raw_tools, list):
+                            typed_items = cast(list[object], raw_tools)
+                            tool_names = [str(t) for t in typed_items]
                         raw_transport = str(
                             ms.get("transport", ms.get("type", "mcporter"))
                         )
-                        # Strip sensitive URL details from transport string
                         if "http" in raw_transport.lower() and "://" in raw_transport:
                             from urllib.parse import urlparse
                             parsed = urlparse(raw_transport.split()[-1])
                             safe_transport = f"HTTP {parsed.scheme}://{parsed.netloc}/..."
                         else:
                             safe_transport = raw_transport
+                        raw_tc = ms.get("tool_count", ms.get("toolCount", len(tool_names)))
                         servers.append({
                             "id": sid,
                             "transport": safe_transport,
-                            "tool_count": int(
-                                ms.get("tool_count", ms.get("toolCount", len(tool_names)))
-                            ),
+                            "tool_count": int(raw_tc) if isinstance(raw_tc, (int, float, str)) else len(tool_names),
                             "tools": tool_names,
                             "source": "mcporter",
                         })
@@ -750,18 +804,18 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         transport = str(body.get("transport", "streamable_http")).strip()
         url = str(body.get("url", "")).strip()
         command = str(body.get("command", "")).strip()
-        args_raw = body.get("args", [])
+        args_raw: object = body.get("args", [])
         args_list: list[str] = []
         if isinstance(args_raw, list):
-            args_list = [str(a) for a in args_raw]
-        env_raw = body.get("env", {})
+            args_list = [str(a) for a in cast(list[object], args_raw)]
+        env_raw: object = body.get("env", {})
         env_dict: dict[str, str] = {}
         if isinstance(env_raw, dict):
-            env_dict = {str(k): str(v) for k, v in env_raw.items()}
-        headers_raw = body.get("headers", {})
+            env_dict = {str(k): str(v) for k, v in cast(dict[object, object], env_raw).items()}
+        headers_raw: object = body.get("headers", {})
         headers_dict: dict[str, str] = {}
         if isinstance(headers_raw, dict):
-            headers_dict = {str(k): str(v) for k, v in headers_raw.items()}
+            headers_dict = {str(k): str(v) for k, v in cast(dict[object, object], headers_raw).items()}
         timeout = int(body.get("timeout", 30))
 
         from whaleclaw.mcp.config import McpServerConfig
@@ -881,24 +935,38 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         support flag so the frontend can display and auto-apply them.
         """
         from whaleclaw.providers.nvidia import NvidiaProvider
+        from whaleclaw.config.schema import ProviderConfig
 
         providers_cfg = config.models
         available: list[dict[str, object]] = []
 
-        all_providers = [
+        builtin_providers = [
             "anthropic",
             "openai",
             "deepseek",
             "qwen",
             "zhipu",
             "minimax",
+            "xiaomi",
             "moonshot",
             "google",
             "nvidia",
         ]
+        custom_providers: list[str] = []
+        if providers_cfg.model_extra:
+            for k, v in providers_cfg.model_extra.items():
+                if isinstance(v, (dict, ProviderConfig)) and k not in builtin_providers:
+                    custom_providers.append(k)
+        all_providers = builtin_providers + custom_providers
 
         for pname in all_providers:
             pcfg = getattr(providers_cfg, pname, None)
+            if pcfg is None and providers_cfg.model_extra:
+                raw = providers_cfg.model_extra.get(pname)
+                if isinstance(raw, dict):
+                    pcfg = ProviderConfig.model_validate(raw)
+                elif isinstance(raw, ProviderConfig):
+                    pcfg = raw
             if not pcfg:
                 continue
             has_auth = bool(pcfg.api_key) or (pcfg.auth_mode == "oauth" and pcfg.oauth_access)
@@ -1254,7 +1322,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 "state": str(result.get("state", "")),
                 "auth_url": str(result.get("auth_url", "")),
                 "redirect_uri": str(result.get("redirect_uri", "")),
-                "expires_in": int(result.get("expires_in", 0) or 0),
+                "expires_in": int(result.get("expires_in", 0) or 0),  # pyright: ignore[reportArgumentType]
             }
         )
 
@@ -1333,8 +1401,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         slug = str(body.get("slug", "")).strip()
         if not slug:
             return JSONResponse({"error": "缺少 slug 参数"}, status_code=400)
-        version_raw = str(body.get("version", "")).strip()
-        version = version_raw or None
+        version_raw = str(body.get("version") or "").strip()
+        version = version_raw if version_raw and version_raw.lower() != "none" else None
         repo_url = str(body.get("repo_url", "")).strip()
 
         cfg = _read_clawhub_cfg()
@@ -1592,24 +1660,29 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         visible = True
         if "visible" in browser_raw:
             visible = bool(browser_raw.get("visible"))
-        return JSONResponse({"visible": visible})
+        cdp_url = str(browser_raw.get("cdp_url", ""))
+        return JSONResponse({"visible": visible, "cdp_url": cdp_url})
 
     @app.post("/api/plugins/browser")
     async def _api_set_browser_config(body: dict[str, Any]) -> JSONResponse:
-        if "visible" not in body:
-            return JSONResponse({"error": "缺少 visible 参数"}, status_code=400)
-        visible = bool(body.get("visible", True))
-
         current_cfg = _as_str_object_dict(config.plugins.get("browser", {}))
-        current_cfg["visible"] = visible
+
+        if "visible" in body:
+            current_cfg["visible"] = bool(body["visible"])
+        if "cdp_url" in body:
+            current_cfg["cdp_url"] = str(body["cdp_url"]).strip()
+
         config.plugins["browser"] = current_cfg
 
         user_cfg = _read_json_config(CONFIG_FILE)
-        uc_plugins_browser = _as_str_object_dict(user_cfg.get("plugins", {}))
-        user_cfg["plugins"] = uc_plugins_browser
-        uc_browser = _as_str_object_dict(uc_plugins_browser.get("browser", {}))
-        uc_plugins_browser["browser"] = uc_browser
-        uc_browser["visible"] = visible
+        uc_plugins = _as_str_object_dict(user_cfg.get("plugins", {}))
+        user_cfg["plugins"] = uc_plugins
+        uc_browser = _as_str_object_dict(uc_plugins.get("browser", {}))
+        uc_plugins["browser"] = uc_browser
+        if "visible" in body:
+            uc_browser["visible"] = bool(body["visible"])
+        if "cdp_url" in body:
+            uc_browser["cdp_url"] = str(body["cdp_url"]).strip()
 
         try:
             _write_json_config(CONFIG_FILE, user_cfg)
@@ -1619,7 +1692,12 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                 status_code=500,
             )
 
-        return JSONResponse({"ok": True, "visible": visible, "persisted_to": str(CONFIG_FILE)})
+        return JSONResponse({
+            "ok": True,
+            "visible": current_cfg.get("visible", True),
+            "cdp_url": current_cfg.get("cdp_url", ""),
+            "persisted_to": str(CONFIG_FILE),
+        })
 
     # ── Memory Style REST ─────────────────────────────────
 

@@ -30,6 +30,8 @@ class SimpleMemoryStore(MemoryStore):
 
     def __init__(self, persist_dir: Path | None = None) -> None:
         self._entries: dict[str, MemoryEntry] = {}
+        self._insert_order: dict[str, int] = {}
+        self._insert_counter: int = 0
         self._persist_dir = persist_dir
         if persist_dir:
             self._load()
@@ -43,6 +45,8 @@ class SimpleMemoryStore(MemoryStore):
             for d in data.get("entries", []):
                 entry = _deserialize_entry(d)
                 self._entries[entry.id] = entry
+                self._insert_order[entry.id] = self._insert_counter
+                self._insert_counter += 1
         except (OSError, json.JSONDecodeError, KeyError):
             pass
 
@@ -65,6 +69,8 @@ class SimpleMemoryStore(MemoryStore):
             last_accessed=now,
         )
         self._entries[entry.id] = entry
+        self._insert_order[entry.id] = self._insert_counter
+        self._insert_counter += 1
         self._save()
         return entry
 
@@ -93,10 +99,15 @@ class SimpleMemoryStore(MemoryStore):
     async def delete(self, memory_id: str) -> bool:
         if memory_id in self._entries:
             del self._entries[memory_id]
+            self._insert_order.pop(memory_id, None)
             self._save()
             return True
         return False
 
     async def list_recent(self, limit: int = 20) -> list[MemoryEntry]:
-        entries = sorted(self._entries.values(), key=lambda e: e.created_at, reverse=True)
+        entries = sorted(
+            self._entries.values(),
+            key=lambda e: (e.created_at, self._insert_order.get(e.id, 0)),
+            reverse=True,
+        )
         return entries[:limit]

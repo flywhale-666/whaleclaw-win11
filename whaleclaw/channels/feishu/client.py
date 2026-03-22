@@ -70,18 +70,20 @@ class FeishuClient:
         if data.get("code") != 0:
             msg = f"获取 tenant_access_token 失败: {data}"
             raise RuntimeError(msg)
-        self._tenant_access_token = data["tenant_access_token"]
+        token: str = data["tenant_access_token"]
+        self._tenant_access_token = token
         self._token_expires_at = time.time() + data.get("expire", 7200) - 60
-        return self._tenant_access_token
+        return token
 
     async def request(
         self, method: str, path: str, **kwargs: Any
     ) -> dict[str, Any]:
         """Make an authenticated API request."""
         token = await self._ensure_token()
-        headers = {
+        extra_headers: dict[str, str] = kwargs.pop("headers", None) or {}
+        headers: dict[str, str] = {
             "Authorization": f"Bearer {token}",
-            **(kwargs.pop("headers", None) or {}),
+            **extra_headers,
         }
         resp = await self._request_with_retry(
             method,
@@ -171,6 +173,28 @@ class FeishuClient:
             params={"type": resource_type},
         )
         return resp.content
+
+    # ── Reaction API ─────────────────────────────────────────
+
+    async def create_reaction(
+        self, message_id: str, emoji_type: str = "EYES"
+    ) -> str:
+        """Add an emoji reaction to a message and return the reaction_id."""
+        data = await self.request(
+            "POST",
+            f"/im/v1/messages/{message_id}/reactions",
+            json={"reaction_type": {"emoji_type": emoji_type}},
+        )
+        return str(data.get("data", {}).get("reaction_id", ""))
+
+    async def delete_reaction(
+        self, message_id: str, reaction_id: str
+    ) -> dict[str, Any]:
+        """Remove a reaction by its reaction_id."""
+        return await self.request(
+            "DELETE",
+            f"/im/v1/messages/{message_id}/reactions/{reaction_id}",
+        )
 
     # ── User API ────────────────────────────────────────────
 

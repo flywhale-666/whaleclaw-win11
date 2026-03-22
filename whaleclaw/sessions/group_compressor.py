@@ -91,6 +91,25 @@ def _clip_text(text: str, max_tokens: int) -> str:
     return text[:char_cap].rstrip()
 
 
+def _compact_tool_content(text: str, *, max_chars: int = 600) -> str:
+    stripped = text.strip()
+    if len(stripped) <= max_chars:
+        return stripped
+    return stripped[:max_chars].rstrip() + "\n...[已截断]"
+
+
+def _compact_prev_group(group: list[Message]) -> list[Message]:
+    compacted: list[Message] = []
+    for msg in group:
+        content = msg.content
+        if msg.role == "tool":
+            content = _compact_tool_content(content)
+        elif msg.role == "assistant" and not msg.images and len(content.strip()) > 600:
+            content = _compact_tool_content(content)
+        compacted.append(msg.model_copy(update={"content": content}))
+    return compacted
+
+
 def _extract_latest_user_text(group: list[Message]) -> str:
     for msg in reversed(group):
         if msg.role == "user" and msg.content.strip():
@@ -108,16 +127,6 @@ def _build_history_summary_block(items: list[tuple[int, str]]) -> str:
     for idx, content in ordered:
         txt = " ".join(content.split())
         lines.append(f"- 第{idx}轮: {txt}")
-    return "\n".join(lines)
-
-
-def _build_recent_raw_block(items: list[tuple[int, list[Message]]]) -> str:
-    if not items:
-        return ""
-    lines = [f"【最近对话原文（最近{len(items)}轮）】"]
-    for idx, group in items:
-        lines.append(f"第{idx}轮:")
-        lines.append(_group_text(group))
     return "\n".join(lines)
 
 
@@ -385,10 +394,10 @@ class SessionGroupCompressor:
                     scheduled += 1
 
         history_items: list[tuple[int, str]] = []
-        recent_l2_items: list[tuple[int, list[Message]]] = []
+        recent_l2_items: list[_WindowItem] = []
         for idx, item in enumerate(plan):
             if item.level == "L2":
-                recent_l2_items.append((item.group_idx, item.group))
+                recent_l2_items.append(item)
                 continue
             content, _ = compressed_results[idx]
             history_items.append((item.group_idx, content))
@@ -400,21 +409,35 @@ class SessionGroupCompressor:
 
         if not recent_l2_items:
             # Fallback: keep latest group raw to preserve current-turn semantics.
-            recent_l2_items.append((plan[-1].group_idx, plan[-1].group))
+            recent_l2_items.append(plan[-1])
 
-        current_group_idx, current_group = recent_l2_items[-1]
-        recent_raw_items = list(reversed(recent_l2_items[-(RECENT_RAW_PREV_GROUPS + 1):]))
-        if recent_raw_items:
-            recent_block = _build_recent_raw_block(recent_raw_items)
-            recent_block = _clip_text(recent_block, 520)
-            if recent_block:
-                rendered.append([Message(role="assistant", content=recent_block)])
+        current_item = recent_l2_items[-1]
+        current_group_idx = current_item.group_idx
+        current_group = current_item.group
+
+        if history_block:
+            rendered.append([Message(role="assistant", content=history_block)])
+
+        prev_recent_items = recent_l2_items[-(RECENT_RAW_PREV_GROUPS + 1):-1]
+        for prev_item in prev_recent_items:
+            rendered.append(_compact_prev_group(prev_item.group))
 
         status_block = _build_task_status_block(current_group_idx, current_group)
         if status_block:
             rendered.append([Message(role="assistant", content=status_block)])
-        if history_block:
-            rendered.append([Message(role="assistant", content=history_block)])
+
+        if any(msg.images for msg in current_group):
+            image_messages = sum(1 for msg in current_group if msg.images)
+            image_count = sum(len(msg.images or []) for msg in current_group)
+            log.debug(
+                "group_compressor.current_group_images_preserved",
+                session_id=session_id,
+                group_idx=current_group_idx,
+                image_messages=image_messages,
+                image_count=image_count,
+            )
+
+        rendered.append(current_group)
 
         pre_truncate_tokens = sum(_group_tokens(g) for g in rendered)
         out = self._truncate_group_atomic(rendered)
@@ -485,17 +508,11 @@ class SessionGroupCompressor:
         total_groups = len(all_groups)
         groups = all_groups[-MAX_WINDOW_GROUPS:]
         start_idx = total_groups - len(groups) + 1
-        recent_groups = all_groups[-RECENT_L2_GROUPS:]
-        recent_over_budget = sum(_group_tokens(g) for g in recent_groups) > CONTENT_BUDGET
         items: list[_WindowItem] = []
         for offset, group in enumerate(groups):
             group_idx = start_idx + offset
             from_tail = total_groups - group_idx + 1
-            if recent_over_budget and from_tail in {1, 2}:
-                level = "L2"
-            elif recent_over_budget and from_tail in {3, 4, 5}:
-                level = "L0"
-            elif from_tail <= RECENT_L2_GROUPS:
+            if from_tail <= RECENT_L2_GROUPS:
                 level = "L2"
             elif from_tail <= RECENT_L2_GROUPS + L1_GROUPS:
                 level = "L1"

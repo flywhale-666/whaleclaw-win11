@@ -62,6 +62,7 @@ class ModelsConfig(BaseModel):
     qwen: ProviderConfig = Field(default_factory=ProviderConfig)
     zhipu: ProviderConfig = Field(default_factory=ProviderConfig)
     minimax: ProviderConfig = Field(default_factory=ProviderConfig)
+    xiaomi: ProviderConfig = Field(default_factory=ProviderConfig)
     moonshot: ProviderConfig = Field(default_factory=ProviderConfig)
     google: ProviderConfig = Field(default_factory=ProviderConfig)
     nvidia: ProviderConfig = Field(default_factory=ProviderConfig)
@@ -108,7 +109,7 @@ class AgentConfig(BaseModel):
     """Agent runtime configuration."""
 
     model: str = "anthropic/claude-sonnet-4-20250514"
-    max_tool_rounds: int = 50
+    max_tool_rounds: int = Field(default=50, description="单次 Agent 调用的最大工具轮数，超出后提示并暂停")
     workspace: str = str(WORKSPACE_DIR)
     thinking_level: str = "off"
     auto_self_heal_on_error: bool = True

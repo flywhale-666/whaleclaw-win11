@@ -34,6 +34,7 @@ _PROJECT_PYTHON_CANDIDATES = (
 _PROJECT_PYTHON = next((path for path in _PROJECT_PYTHON_CANDIDATES if path.is_file()), None)
 _PROJECT_PYTHON_BIN = _PROJECT_PYTHON.parent if _PROJECT_PYTHON is not None else None
 _NANO_BANANA_SCRIPT_RE = re.compile(r"test_nano_banana(?:_\d+)?\.py", re.IGNORECASE)
+_NANO_BANANA_SUCCESS_RE = re.compile(r"(?:文生图|图生图)成功:\s*\S+\.png", re.IGNORECASE)
 _PYTHON_CMD_RE = re.compile(r"(?<![\w./-])(python3|python)(?=\s|$)")
 # LLM 有时拼出 /path/to/./python/bin/python3.12 这类含 ./ 的错误路径
 _BROKEN_PROJECT_PYTHON_RE = re.compile(
@@ -62,6 +63,33 @@ _HOME_ALIAS_ROOT = _TMP_ALIAS_ROOT.parent.parent
 _WINDOWS_ROOT_HOME_RE = re.compile(
     r"(?i)(?P<prefix>(?:^|[\s'\"=;]))(?P<path>[A-Z]:\\root\\\.whaleclaw(?:\\[^\s'\";|&]*)?)"
 )
+
+_CREDENTIALS_DIR = Path.home() / ".whaleclaw" / "credentials"
+_CREDENTIAL_ENV_MAP: dict[str, str] = {
+    "nano_banana_api_key.txt": "NANO_BANANA_API_KEY",
+    "tavily_api_key.txt": "TAVILY_API_KEY",
+}
+
+
+def _inject_saved_credentials(env: dict[str, str]) -> None:
+    """Auto-inject saved credential files as environment variables.
+
+    Ensures scripts can always find API keys regardless of which skill
+    context the LLM is operating in.
+    """
+    if not _CREDENTIALS_DIR.is_dir():
+        return
+    for filename, env_var in _CREDENTIAL_ENV_MAP.items():
+        if env.get(env_var):
+            continue
+        path = _CREDENTIALS_DIR / filename
+        try:
+            if path.is_file():
+                value = path.read_text(encoding="utf-8").strip()
+                if value:
+                    env[env_var] = value
+        except Exception:
+            pass
 
 
 class _CompatStreamReader:
@@ -170,7 +198,17 @@ def _prefer_project_python_for_direct_script(command: str) -> str:
 
 
 def _resolve_command_timeout(command: str, requested_timeout: int) -> int:
-    """Apply command-specific timeout floors."""
+    """Apply command-specific timeout floors.
+
+    Checks active skill hooks first; falls back to built-in nano-banana pattern.
+    """
+    from whaleclaw.agent.helpers.tool_execution import _active_skill_hooks
+
+    if _active_skill_hooks is not None:
+        pattern = getattr(_active_skill_hooks, "long_running_script_pattern", None)
+        if pattern is not None and pattern.search(command):
+            floor = getattr(_active_skill_hooks, "long_running_timeout_seconds", 300)
+            return max(requested_timeout, floor)
     if _NANO_BANANA_SCRIPT_RE.search(command):
         return max(requested_timeout, 300)
     return requested_timeout
@@ -188,6 +226,7 @@ def _normalize_tmp_aliases(command: str) -> str:
 
 
 def _normalize_home_aliases(command: str) -> str:
+    home_str = str(Path.home())
     replacements = {
         "~/.whaleclaw/workspace/tmp": str(_TMP_ALIAS_ROOT),
         "~/.whaleclaw": str(_HOME_ALIAS_ROOT),
@@ -197,6 +236,18 @@ def _normalize_home_aliases(command: str) -> str:
     normalized = command
     for source, target in replacements.items():
         normalized = normalized.replace(source, target)
+
+    if os.name == "nt":
+        cmd_env_vars = {
+            "%USERPROFILE%": home_str,
+            "%HOME%": home_str,
+            "%HOMEDRIVE%%HOMEPATH%": home_str,
+            "%TEMP%": os.environ.get("TEMP", str(Path(home_str) / "AppData" / "Local" / "Temp")),
+            "%TMP%": os.environ.get("TMP", os.environ.get("TEMP", "")),
+        }
+        for var, value in cmd_env_vars.items():
+            if value and var in normalized:
+                normalized = normalized.replace(var, value)
 
     def _replace_windows_root_home(match: re.Match[str]) -> str:
         prefix = match.group("prefix")
@@ -607,6 +658,7 @@ class BashTool(Tool):
         env = os.environ.copy()
         if _PROJECT_PYTHON_BIN is not None and _PROJECT_PYTHON_BIN.is_dir():
             env["PATH"] = f"{_PROJECT_PYTHON_BIN}{os.pathsep}{env.get('PATH', '')}"
+        _inject_saved_credentials(env)
         _TMP_ALIAS_ROOT.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -664,10 +716,18 @@ class BashTool(Tool):
             output += f"\n[stderr]\n{err}"
         output += f"\n[exit_code: {exit_code}]"
 
+        is_success = exit_code == 0
+        if (
+            not is_success
+            and _NANO_BANANA_SCRIPT_RE.search(command)
+            and _NANO_BANANA_SUCCESS_RE.search(out)
+        ):
+            is_success = True
+
         return ToolResult(
-            success=exit_code == 0,
+            success=is_success,
             output=output.strip(),
-            error=err if exit_code != 0 else None,
+            error=err if not is_success else None,
         )
 
 

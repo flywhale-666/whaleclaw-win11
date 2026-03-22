@@ -124,3 +124,74 @@ async def test_ppt_edit_apply_business_style_restyles_dark_bar(tmp_path) -> None
     prs2 = Presentation(str(ppt_path))
     fill_rgb = prs2.slides[0].shapes[0].fill.fore_color.rgb
     assert fill_rgb[0] > 0 and fill_rgb[1] > 0 and fill_rgb[2] > 0
+
+
+@pytest.mark.asyncio
+async def test_ppt_edit_read_slide(tmp_path) -> None:
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    ppt_path = tmp_path / "read.pptx"
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    txBox = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+    txBox.text_frame.text = "测试文本内容"
+    prs.save(str(ppt_path))
+
+    tool = PptEditTool()
+    result = await tool.execute(path=str(ppt_path), slide_index=1, action="read_slide")
+    assert result.success is True
+    assert "测试文本内容" in result.output
+    assert "第 1/1 页" in result.output
+
+
+@pytest.mark.asyncio
+async def test_ppt_edit_read_slide_empty(tmp_path) -> None:
+    from pptx import Presentation
+
+    ppt_path = tmp_path / "empty.pptx"
+    prs = Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    prs.save(str(ppt_path))
+
+    tool = PptEditTool()
+    result = await tool.execute(path=str(ppt_path), slide_index=1, action="read_slide")
+    assert result.success is True
+    assert "空白页" in result.output or "0 个元素" in result.output
+
+
+@pytest.mark.asyncio
+async def test_ppt_edit_delete_slide(tmp_path) -> None:
+    from pptx import Presentation
+
+    ppt_path = tmp_path / "del.pptx"
+    prs = Presentation()
+    s1 = prs.slides.add_slide(prs.slide_layouts[6])
+    s1.shapes.add_textbox(914400, 914400, 914400, 914400).text_frame.text = "页1"
+    s2 = prs.slides.add_slide(prs.slide_layouts[6])
+    s2.shapes.add_textbox(914400, 914400, 914400, 914400).text_frame.text = "页2"
+    prs.save(str(ppt_path))
+
+    tool = PptEditTool()
+    result = await tool.execute(path=str(ppt_path), slide_index=1, action="delete_slide")
+    assert result.success is True
+    assert "剩余 1 页" in result.output
+
+    prs2 = Presentation(str(ppt_path))
+    assert len(prs2.slides) == 1
+    assert prs2.slides[0].shapes[0].text_frame.text == "页2"
+
+
+@pytest.mark.asyncio
+async def test_ppt_edit_delete_slide_last_one_rejected(tmp_path) -> None:
+    from pptx import Presentation
+
+    ppt_path = tmp_path / "single.pptx"
+    prs = Presentation()
+    prs.slides.add_slide(prs.slide_layouts[6])
+    prs.save(str(ppt_path))
+
+    tool = PptEditTool()
+    result = await tool.execute(path=str(ppt_path), slide_index=1, action="delete_slide")
+    assert result.success is False
+    assert "至少保留 1 页" in (result.error or "")

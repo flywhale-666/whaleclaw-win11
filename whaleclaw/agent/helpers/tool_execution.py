@@ -8,6 +8,7 @@ import re
 import shlex
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -65,10 +66,29 @@ _NANO_BANANA_ARGPARSE_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"error:\s+the following arguments are required\b", re.IGNORECASE),
     re.compile(r"error:\s+argument\s+--[a-z0-9][a-z0-9_-]*\b", re.IGNORECASE),
 )
+_CRONTAB_CMD_RE = re.compile(
+    r"\bcrontab\b",
+    re.IGNORECASE,
+)
+
+
+def _is_crontab_command(command: str) -> bool:
+    """Return True if *command* attempts to manipulate the system crontab."""
+    return bool(_CRONTAB_CMD_RE.search(command))
+
+
 _RATIO_VALUE_RE = re.compile(r"^\d+:\d+$")
 _NANO_BANANA_SPLIT_RE = re.compile(r"\s*(?:&&|;|\r?\n)+\s*")
 _NANO_BANANA_BATCH_SIZE = 5
 _NANO_BANANA_BATCH_DELAY_SECONDS = 1.5
+
+_active_skill_hooks: object | None = None
+
+
+def set_active_skill_hooks(hooks: object | None) -> None:
+    """Set the active skill hooks for the current execution context."""
+    global _active_skill_hooks  # noqa: PLW0603
+    _active_skill_hooks = hooks
 
 
 def create_default_registry(
@@ -195,7 +215,7 @@ async def persist_message(
     *,
     tool_call_id: str | None = None,
     tool_name: str | None = None,
-    tool_calls: list[object] | None = None,
+    tool_calls: Sequence[object] | None = None,
 ) -> None:
     try:
         await manager.add_message(
@@ -204,7 +224,7 @@ async def persist_message(
             content,
             tool_call_id=tool_call_id,
             tool_name=tool_name,
-            tool_calls=tool_calls,  # type: ignore[arg-type]
+            tool_calls=tool_calls,
         )
     except Exception as exc:
         log.debug("agent.persist_failed", error=str(exc))
@@ -225,6 +245,25 @@ async def execute_tool(
 ) -> tuple[str, ToolResult]:
     if tc.name == "bash":
         tc = _normalize_nano_banana_bash_tool_call(tc)
+        raw_command = str(tc.arguments.get("command", ""))
+        if _is_crontab_command(raw_command):
+            result = ToolResult(
+                success=False,
+                output="",
+                error=(
+                    "禁止通过 bash 操作系统 crontab（macOS 会弹 TCC 权限窗导致超时）。\n"
+                    "请使用内置工具：\n"
+                    "- reminder(message=..., minutes=N) 设置一次性定时任务\n"
+                    "- cron(action='add', ...) 设置重复定时任务\n"
+                    "- cron(action='list') 查看已有定时任务\n"
+                    "- cron(action='remove', job_id=...) 删除定时任务"
+                ),
+            )
+            if on_tool_call:
+                await on_tool_call(tc.name, tc.arguments)
+            if on_tool_result:
+                await on_tool_result(tc.name, result)
+            return tc.id, result
     if on_tool_call:
         await on_tool_call(tc.name, tc.arguments)
 
@@ -374,49 +413,52 @@ def _normalize_nano_banana_bash_tool_call(tc: ToolCall) -> ToolCall:
     return ToolCall(id=tc.id, name=tc.name, arguments=updated_args)
 
 
+_NANO_BANANA_DISPLAY_TO_MODEL: dict[str, str] = {
+    "香蕉2": "gemini-3.1-flash-image-preview",
+    "香蕉pro": "nano-banana-2",
+}
+
+
 def _normalize_nano_banana_command(command: str) -> str:
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return command
-    if not tokens or not any(_NANO_BANANA_SCRIPT_RE.search(token) for token in tokens):
+    if not _NANO_BANANA_SCRIPT_RE.search(command):
         return command
 
+    result = command
     changed = False
-    normalized: list[str] = []
-    idx = 0
-    while idx < len(tokens):
-        token = tokens[idx]
-        next_token = tokens[idx + 1] if idx + 1 < len(tokens) else None
 
-        if token == "--api-base":
-            normalized.append("--base-url")
+    # --api-base -> --base-url
+    if "--api-base" in result:
+        result = result.replace("--api-base", "--base-url")
+        changed = True
+
+    # --mode text2image -> --mode text
+    if "text2image" in result:
+        result = re.sub(r"--mode\s+text2image\b", "--mode text", result)
+        if result != command:
             changed = True
-            idx += 1
-            continue
 
-        if token == "--mode" and next_token is not None:
-            if next_token == "text2image":
-                normalized.extend(["--mode", "text"])
+    # --size <ratio> -> --aspect-ratio <ratio>  (only when value looks like a ratio)
+    size_match = re.search(r"--size\s+(\d+:\d+)(?=\s|$)", result)
+    if size_match:
+        result = result.replace(size_match.group(0), f"--aspect-ratio {size_match.group(1)}")
+        changed = True
+
+    # --model / --edit-model: map display names to model IDs
+    for flag in ("--model", "--edit-model"):
+        for display_name, model_id in _NANO_BANANA_DISPLAY_TO_MODEL.items():
+            # Match flag followed by the display name (possibly quoted)
+            pattern = re.compile(
+                re.escape(flag) + r"""\s+['"]?""" + re.escape(display_name) + r"""['"]?(?=\s|$)"""
+            )
+            replacement = f"{flag} {model_id}"
+            new_result = pattern.sub(replacement, result)
+            if new_result != result:
+                result = new_result
                 changed = True
-                idx += 2
-                continue
-            normalized.extend([token, next_token])
-            idx += 2
-            continue
-
-        if token == "--size" and next_token is not None and _RATIO_VALUE_RE.match(next_token):
-            normalized.extend(["--aspect-ratio", next_token])
-            changed = True
-            idx += 2
-            continue
-
-        normalized.append(token)
-        idx += 1
 
     if not changed:
         return command
-    return shlex.join(normalized)
+    return result
 
 
 async def _maybe_retry_after_mkdir(
@@ -738,6 +780,20 @@ def validate_tool_call_args(tc: ToolCall, registry: ToolRegistry) -> str | None:
                     return f"browser.{field} 为空"
             elif value is None:
                 return f"browser.{field} 缺失"
+    if tc.name == "ppt_edit":
+        action = str(tc.arguments.get("action", "")).strip()
+        if action != "add_slide":
+            si = tc.arguments.get("slide_index")
+            if si is None:
+                return f"ppt_edit.slide_index 缺失（action={action or 'replace_text'} 时必填）"
+            try:
+                if int(si) <= 0:
+                    return "ppt_edit.slide_index 必须 >= 1"
+            except (TypeError, ValueError):
+                return f"ppt_edit.slide_index 不是有效整数: {si}"
+        path_val = tc.arguments.get("path")
+        if not isinstance(path_val, str) or not path_val.strip():
+            return "ppt_edit.path 缺失或为空"
     if tc.name == "file_edit":
         old_string = tc.arguments.get("old_string")
         new_string = tc.arguments.get("new_string")

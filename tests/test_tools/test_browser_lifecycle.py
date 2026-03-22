@@ -55,6 +55,7 @@ async def test_ensure_browser_recreates_closed_page(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(tool, "_dispose_browser", fake_dispose_browser)
     monkeypatch.setattr(tool, "_launch_browser", fake_launch_browser)
+    monkeypatch.setattr(BrowserTool, "_read_cdp_url", staticmethod(lambda: ""))
 
     page = await tool._ensure_browser()
 

@@ -81,7 +81,7 @@ class DesktopCaptureTool(Tool):
             return await self._capture_macos(output_path, wake=wake, delay_ms=delay_ms)
         if sys.platform == "win32":
             return await self._capture_windows(output_path)
-        return ToolResult(success=False, output="", error=f"desktop_capture 不支持当前平台: {sys.platform}")
+        return ToolResult(success=False, output="", error=f"desktop_capture 仅支持 macOS 和 Windows，不支持当前平台: {sys.platform}")
 
     async def _capture_macos(self, output_path: "Path", *, wake: bool, delay_ms: int) -> ToolResult:
         if wake:

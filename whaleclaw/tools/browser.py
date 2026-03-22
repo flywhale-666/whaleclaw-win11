@@ -24,6 +24,7 @@ _ACTIONS = [
     "get_text",
     "evaluate",
     "search_images",
+    "upload",
     "back",
     "close",
 ]
@@ -139,7 +140,12 @@ _IMAGE_ENGINES: list[tuple[str, Callable[[str], str], str]] = [
 
 
 class BrowserTool(Tool):
-    """Browser control tool — uses local Chrome via Playwright.
+    """Browser control tool -- uses local Chrome via Playwright.
+
+    Supports two modes:
+    - **CDP mode**: connect to an existing Chrome via ``--remote-debugging-port``
+      (preserves user login sessions). Configure ``plugins.browser.cdp_url``.
+    - **Launch mode** (default): start a fresh Chrome instance.
 
     Supports navigation, screenshots, DOM interaction, JS evaluation,
     and an image-search shortcut that downloads the first result.
@@ -150,6 +156,7 @@ class BrowserTool(Tool):
         self._context: Any = None
         self._page: Any = None
         self._playwright: Any = None
+        self._cdp_mode: bool = False
 
     @staticmethod
     def _is_page_usable(page: Any) -> bool:
@@ -177,6 +184,12 @@ class BrowserTool(Tool):
         return True
 
     async def _dispose_browser(self) -> None:
+        """Release browser resources.
+
+        In CDP mode we only disconnect (don't close the user's browser).
+        In launch mode we close everything.
+        """
+        cdp = self._cdp_mode
         context = self._context
         browser = self._browser
         playwright = self._playwright
@@ -185,23 +198,133 @@ class BrowserTool(Tool):
         self._browser = None
         self._page = None
         self._playwright = None
+        self._cdp_mode = False
 
-        if context is not None:
-            with suppress(Exception):
-                await context.close()
-        if browser is not None:
-            with suppress(Exception):
-                await browser.close()
-        if playwright is not None:
-            with suppress(Exception):
-                await playwright.stop()
+        if cdp:
+            # CDP mode: just disconnect, don't close user's browser/contexts
+            if browser is not None:
+                with suppress(Exception):
+                    await browser.close()  # disconnect only
+            if playwright is not None:
+                with suppress(Exception):
+                    await playwright.stop()
+        else:
+            if context is not None:
+                with suppress(Exception):
+                    await context.close()
+            if browser is not None:
+                with suppress(Exception):
+                    await browser.close()
+            if playwright is not None:
+                with suppress(Exception):
+                    await playwright.stop()
 
-    async def _launch_browser(self) -> Any:
+    # ── Config readers ────────────────────────────────────
+
+    @staticmethod
+    def _read_browser_config() -> dict[str, object]:
+        """Read ``plugins.browser`` dict from user config file."""
+        try:
+            if not CONFIG_FILE.is_file():
+                return {}
+            raw_obj: object = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if not isinstance(raw_obj, dict):
+                return {}
+            raw = cast(dict[str, object], raw_obj)
+            plugins_obj = raw.get("plugins")
+            if not isinstance(plugins_obj, dict):
+                return {}
+            plugins = cast(dict[str, object], plugins_obj)
+            browser_cfg_obj = plugins.get("browser")
+            if not isinstance(browser_cfg_obj, dict):
+                return {}
+            return cast(dict[str, object], browser_cfg_obj)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _read_cdp_url() -> str:
+        """Read ``plugins.browser.cdp_url`` from user config.
+
+        Returns:
+            CDP endpoint URL (e.g. ``http://localhost:9222``), or empty string.
+        """
+        cfg = BrowserTool._read_browser_config()
+        cdp_url = cfg.get("cdp_url", "")
+        return str(cdp_url).strip() if cdp_url else ""
+
+    @staticmethod
+    def _is_headless_enabled() -> bool:
+        """Read browser visibility setting from user config.
+
+        plugins.browser.visible=true  -> headless=False (show browser window)
+        plugins.browser.visible=false -> headless=True  (no browser window)
+        """
+        cfg = BrowserTool._read_browser_config()
+        visible_obj = cfg.get("visible")
+        if visible_obj is None:
+            return False
+        return not bool(visible_obj)
+
+    # ── Browser lifecycle ─────────────────────────────────
+
+    async def _connect_cdp(self, cdp_url: str) -> Any:
+        """Connect to an existing Chrome instance via CDP.
+
+        Args:
+            cdp_url: CDP endpoint, e.g. ``http://localhost:9222``.
+
+        Returns:
+            The first page of the default context.
+        """
         from whaleclaw.tools.deps import ensure_tool_dep
 
         if not ensure_tool_dep("playwright"):
             raise RuntimeError(
-                "playwright 瀹夎澶辫触锛岃鎵嬪姩鎵ц: "
+                "playwright is not installed: "
+                "pip install playwright && playwright install chromium"
+            )
+
+        from playwright.async_api import async_playwright
+
+        self._playwright = await async_playwright().start()
+        self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+        self._cdp_mode = True
+
+        contexts = self._browser.contexts
+        if contexts:
+            self._context = contexts[0]
+            pages = self._context.pages
+            if pages:
+                self._page = pages[0]
+            else:
+                self._page = await self._context.new_page()
+        else:
+            self._context = await self._browser.new_context(viewport=_VIEWPORT)
+            self._page = await self._context.new_page()
+
+        _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        _DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Suppress Runtime.Enable leak that anti-bot systems (Cloudflare/DataDome)
+        # use to detect CDP-controlled browsers.
+        try:
+            cdp_session = await self._page.context.new_cdp_session(self._page)
+            await cdp_session.send("Runtime.disable")
+            await cdp_session.detach()
+        except Exception as exc:
+            log.debug("browser.runtime_disable_failed", error=str(exc))
+
+        log.info("browser.cdp_connected", endpoint=cdp_url)
+        return self._page
+
+    async def _launch_browser(self) -> Any:
+        """Launch a fresh Chrome instance (fallback when CDP is not configured)."""
+        from whaleclaw.tools.deps import ensure_tool_dep
+
+        if not ensure_tool_dep("playwright"):
+            raise RuntimeError(
+                "playwright is not installed: "
                 "pip install playwright && playwright install chromium"
             )
 
@@ -214,6 +337,7 @@ class BrowserTool(Tool):
             headless=headless,
             args=["--disable-blink-features=AutomationControlled"],
         )
+        self._cdp_mode = False
         self._context = await self._browser.new_context(
             viewport=_VIEWPORT,
             user_agent=(
@@ -228,50 +352,22 @@ class BrowserTool(Tool):
         log.info("browser.launched", channel="chrome", headless=headless)
         return self._page
 
-    @staticmethod
-    def _is_headless_enabled() -> bool:
-        """Read browser visibility setting from user config.
-
-        plugins.browser.visible=true  -> headless=False (show browser window)
-        plugins.browser.visible=false -> headless=True  (no browser window)
-        """
-        try:
-            if not CONFIG_FILE.is_file():
-                return False
-            raw_obj: object = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            if not isinstance(raw_obj, dict):
-                return False
-            raw = cast(dict[str, object], raw_obj)
-            plugins_obj = raw.get("plugins")
-            if not isinstance(plugins_obj, dict):
-                return False
-            plugins = cast(dict[str, object], plugins_obj)
-            browser_cfg_obj = plugins.get("browser")
-            if not isinstance(browser_cfg_obj, dict):
-                return False
-            browser_cfg = cast(dict[str, object], browser_cfg_obj)
-            visible_obj = browser_cfg.get("visible")
-            if visible_obj is None:
-                return False
-            return not bool(visible_obj)
-        except Exception:
-            return False
-
     @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="browser",
             description=(
                 "Control a real Chrome browser. Actions: "
-                "navigate(url) — open URL; "
-                "screenshot — capture current page; "
-                "click(selector) — click element; "
-                "type(selector, text) — type into input; "
-                "get_text(selector?) — extract page/element text; "
-                "evaluate(script) — run JavaScript; "
-                "search_images(query) — image search and download one image per query; "
-                "back — go back; "
-                "close — close browser."
+                "navigate(url) -- open URL; "
+                "screenshot -- capture current page; "
+                "click(selector) -- click element; "
+                "type(selector, text) -- type into input; "
+                "get_text(selector?) -- extract page/element text; "
+                "evaluate(script) -- run JavaScript; "
+                "search_images(query) -- image search and download one image per query; "
+                "upload(selector, file_paths) -- upload files to a file input element; "
+                "back -- go back; "
+                "close -- close browser."
             ),
             parameters=[
                 ToolParameter(
@@ -290,7 +386,7 @@ class BrowserTool(Tool):
                 ToolParameter(
                     name="selector",
                     type="string",
-                    description="CSS selector for click/type/get_text.",
+                    description="CSS selector for click/type/get_text/upload.",
                     required=False,
                 ),
                 ToolParameter(
@@ -299,7 +395,7 @@ class BrowserTool(Tool):
                     description=(
                         "Text to type, or search query for search_images. "
                         "For image search use explicit keywords, e.g. "
-                        "'杨幂 近照 高清 人像' or 'cute cat photo hd'."
+                        "'cute cat photo hd'."
                     ),
                     required=False,
                 ),
@@ -309,11 +405,20 @@ class BrowserTool(Tool):
                     description="JavaScript code for evaluate action.",
                     required=False,
                 ),
+                ToolParameter(
+                    name="file_paths",
+                    type="string",
+                    description=(
+                        "For upload action: comma-separated absolute file paths "
+                        "to upload, e.g. 'C:/Users/me/pic1.jpg,C:/Users/me/pic2.png'."
+                    ),
+                    required=False,
+                ),
             ],
         )
 
     async def _ensure_browser(self, *, force_reset: bool = False) -> Any:
-        """Launch browser if not already running; auto-installs playwright."""
+        """Ensure browser is running. Prefers CDP if configured."""
         if force_reset:
             await self._dispose_browser()
         elif self._is_page_usable(self._page):
@@ -325,16 +430,37 @@ class BrowserTool(Tool):
             or self._playwright is not None
         ):
             await self._dispose_browser()
+
+        # Try CDP first
+        cdp_url = self._read_cdp_url()
+        if cdp_url:
+            try:
+                return await self._connect_cdp(cdp_url)
+            except Exception as exc:
+                log.warning(
+                    "browser.cdp_connect_failed",
+                    endpoint=cdp_url,
+                    error=str(exc),
+                )
+                # Clean up partial state before falling back
+                await self._dispose_browser()
+
         return await self._launch_browser()
 
     async def _close(self) -> ToolResult:
+        was_cdp = self._cdp_mode
         await self._dispose_browser()
+        if was_cdp:
+            return ToolResult(
+                success=True,
+                output="browser disconnected (CDP mode, Chrome keeps running)",
+            )
         return ToolResult(success=True, output="browser closed")
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         action: str = kwargs.get("action", "")
         if not action:
-            return ToolResult(success=False, output="", error="action 参数为空")
+            return ToolResult(success=False, output="", error="action is empty")
 
         if action == "close":
             return await self._close()
@@ -342,7 +468,7 @@ class BrowserTool(Tool):
         try:
             page = await self._ensure_browser()
         except Exception as exc:
-            return ToolResult(success=False, output="", error=f"浏览器启动失败: {exc}")
+            return ToolResult(success=False, output="", error=f"browser launch failed: {exc}")
 
         try:
             return await self._dispatch(page, action, kwargs)
@@ -354,12 +480,12 @@ class BrowserTool(Tool):
         if action == "navigate":
             url = kwargs.get("url", "")
             if not url:
-                return ToolResult(success=False, output="", error="url 参数为空")
+                return ToolResult(success=False, output="", error="url is empty")
             await page.goto(url, timeout=_TIMEOUT, wait_until="domcontentloaded")
             title = await page.title()
             return ToolResult(
                 success=True,
-                output=f"已打开: {url}\n标题: {title}",
+                output=f"Navigated to: {url}\nTitle: {title}",
             )
 
         elif action == "screenshot":
@@ -368,20 +494,20 @@ class BrowserTool(Tool):
         elif action == "click":
             selector = kwargs.get("selector", "")
             if not selector:
-                return ToolResult(success=False, output="", error="selector 参数为空")
+                return ToolResult(success=False, output="", error="selector is empty")
             await page.click(selector, timeout=_TIMEOUT)
-            return ToolResult(success=True, output=f"已点击: {selector}")
+            return ToolResult(success=True, output=f"Clicked: {selector}")
 
         elif action == "type":
             selector = kwargs.get("selector", "")
             text = kwargs.get("text", "")
             if not selector or not text:
                 return ToolResult(
-                    success=False, output="", error="selector 和 text 参数必填"
+                    success=False, output="", error="selector and text are required"
                 )
             await page.fill(selector, text, timeout=_TIMEOUT)
             return ToolResult(
-                success=True, output=f"已输入 '{text}' 到 {selector}"
+                success=True, output=f"Typed '{text}' into {selector}"
             )
 
         elif action == "get_text":
@@ -390,21 +516,21 @@ class BrowserTool(Tool):
                 el = await page.query_selector(selector)
                 if el is None:
                     return ToolResult(
-                        success=False, output="", error=f"元素未找到: {selector}"
+                        success=False, output="", error=f"Element not found: {selector}"
                     )
                 text = await el.inner_text()
             else:
                 text = await page.inner_text("body")
             truncated = text[:5000]
             if len(text) > 5000:
-                truncated += f"\n...(截断，共 {len(text)} 字符)"
+                truncated += f"\n...(truncated, total {len(text)} chars)"
             return ToolResult(success=True, output=truncated)
 
         elif action == "evaluate":
             script = kwargs.get("script", "")
             if not script:
                 return ToolResult(
-                    success=False, output="", error="script 参数为空"
+                    success=False, output="", error="script is empty"
                 )
             result = await page.evaluate(script)
             return ToolResult(success=True, output=str(result)[:5000])
@@ -413,7 +539,7 @@ class BrowserTool(Tool):
             query = kwargs.get("text", "")
             if not query:
                 return ToolResult(
-                    success=False, output="", error="text 参数为空（搜索关键词）"
+                    success=False, output="", error="text is empty (search query)"
                 )
             try:
                 normalized_query = _normalize_image_query(str(query))
@@ -421,20 +547,107 @@ class BrowserTool(Tool):
                 return ToolResult(
                     success=False,
                     output="",
-                    error=(
-                        f"{exc}。请使用明确关键词，如："
-                        "“杨幂 近照 高清 人像”或“可爱猫咪 photo hd”"
-                    ),
+                    error=str(exc),
                 )
             return await self._search_images(page, normalized_query)
+
+        elif action == "upload":
+            return await self._upload_files(page, kwargs)
 
         elif action == "back":
             await page.go_back(timeout=_TIMEOUT)
             title = await page.title()
-            return ToolResult(success=True, output=f"已后退，当前页: {title}")
+            return ToolResult(success=True, output=f"Went back, current page: {title}")
 
         return ToolResult(
-            success=False, output="", error=f"未知 action: {action}"
+            success=False, output="", error=f"Unknown action: {action}"
+        )
+
+    async def _upload_files(self, page: Any, kwargs: dict[str, Any]) -> ToolResult:
+        """Upload files by clicking the upload trigger and intercepting the file chooser.
+
+        Flow: listen for ``filechooser`` event → click the upload button/area →
+        Playwright intercepts the OS file dialog and fills in the files
+        programmatically.  From the website's perspective this looks identical
+        to a real user clicking and selecting files.
+
+        Works cross-platform (Windows/macOS/Linux).
+        """
+        import asyncio as _aio
+        from pathlib import Path as _Path
+
+        selector = str(kwargs.get("selector", "")).strip()
+        raw_paths = str(kwargs.get("file_paths", "")).strip()
+        if not raw_paths:
+            return ToolResult(success=False, output="", error="file_paths is required for upload action")
+
+        paths: list[str] = []
+        for p in raw_paths.split(","):
+            p = p.strip().strip("'\"")
+            if not p:
+                continue
+            resolved = _Path(p).expanduser().resolve()
+            if not resolved.is_file():
+                return ToolResult(
+                    success=False, output="",
+                    error=f"File not found: {resolved}",
+                )
+            paths.append(str(resolved))
+
+        if not paths:
+            return ToolResult(success=False, output="", error="No valid file paths provided")
+
+        if not selector:
+            selector = 'input[type="file"]'
+
+        try:
+            fc_future: _aio.Future[Any] = _aio.get_event_loop().create_future()
+
+            def _on_filechooser(chooser: Any) -> None:
+                if not fc_future.done():
+                    fc_future.set_result(chooser)
+
+            page.on("filechooser", _on_filechooser)
+            try:
+                el = await page.query_selector(selector)
+                if el is None:
+                    return ToolResult(
+                        success=False, output="",
+                        error=f"Upload element not found: {selector}",
+                    )
+                visible = await el.is_visible()
+                if visible:
+                    await el.click(timeout=5000)
+                else:
+                    await el.dispatch_event("click")
+
+                file_chooser = await _aio.wait_for(fc_future, timeout=10.0)
+                await file_chooser.set_files(paths)
+            finally:
+                page.remove_listener("filechooser", _on_filechooser)
+
+        except _aio.TimeoutError:
+            log.debug("browser.upload_filechooser_timeout", selector=selector)
+            el = await page.query_selector(selector)
+            if el is None:
+                all_inputs = await page.query_selector_all('input[type="file"]')
+                el = all_inputs[0] if all_inputs else None
+            if el is None:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"File input not found and filechooser timed out: {selector}",
+                )
+            if len(paths) == 1:
+                await el.set_input_files(paths[0])
+            else:
+                await el.set_input_files(paths)
+        except Exception as exc:
+            return ToolResult(success=False, output="", error=f"Upload failed: {exc}")
+
+        names = [_Path(p).name for p in paths]
+        return ToolResult(
+            success=True,
+            output=f"Uploaded {len(paths)} file(s): {', '.join(names)}",
         )
 
     async def _screenshot(self, page: Any) -> ToolResult:
@@ -442,11 +655,18 @@ class BrowserTool(Tool):
             page = await self._ensure_browser(force_reset=True)
         filename = f"screenshot_{uuid.uuid4().hex[:8]}.png"
         path = _SCREENSHOT_DIR / filename
-        await page.screenshot(path=str(path), full_page=False)
-        return ToolResult(
-            success=True,
-            output=f"截图已保存: {path}",
-        )
+
+        # Mock document.fonts so Playwright won't wait for font loading
+        # (XHS editor fonts load forever, causing screenshot timeout)
+        with suppress(Exception):
+            await page.evaluate(
+                "document.fonts = {ready: Promise.resolve(), check: () => true, "
+                "addEventListener: () => {}, removeEventListener: () => {}}"
+            )
+
+        await page.screenshot(path=str(path), full_page=False, timeout=_TIMEOUT)
+
+        return ToolResult(success=True, output=f"Screenshot saved: {path}")
 
     async def _search_images(self, page: Any, query: str) -> ToolResult:
         """Image search -> download first result. Tries Bing then Google."""
@@ -471,8 +691,8 @@ class BrowserTool(Tool):
             ss = await self._screenshot(page)
             return ToolResult(
                 success=False,
-                output=f"未找到图片结果。页面截图: {ss.output}",
-                error="图片搜索未返回有效结果",
+                output=f"No image results found. Page screenshot: {ss.output}",
+                error="Image search returned no valid results",
             )
 
         import httpx
@@ -512,11 +732,11 @@ class BrowserTool(Tool):
                         return ToolResult(
                             success=True,
                             output=(
-                                f"搜索词: {query}\n"
-                                f"图片已下载，请使用以下路径展示（禁止修改或编造路径）:\n"
-                                f"![图片]({path})\n"
-                                f"文件: {path}\n"
-                                f"大小: {size_kb:.0f}KB"
+                                f"Query: {query}\n"
+                                f"Image downloaded (DO NOT modify or fabricate path):\n"
+                                f"![image]({path})\n"
+                                f"File: {path}\n"
+                                f"Size: {size_kb:.0f}KB"
                             ),
                         )
                     if best_fallback is None or len(data) > best_fallback[1]:
@@ -532,18 +752,18 @@ class BrowserTool(Tool):
             return ToolResult(
                 success=True,
                 output=(
-                    f"搜索词: {query}\n"
-                    f"图片已下载（未找到更大图片），请使用以下路径展示（禁止修改或编造路径）:\n"
-                    f"![图片]({fb_path})\n"
-                    f"文件: {fb_path}\n"
-                    f"大小: {size_kb:.0f}KB"
+                    f"Query: {query}\n"
+                    f"Image downloaded (smaller, DO NOT modify or fabricate path):\n"
+                    f"![image]({fb_path})\n"
+                    f"File: {fb_path}\n"
+                    f"Size: {size_kb:.0f}KB"
                 ),
             )
 
         return ToolResult(
             success=False,
             output="",
-            error="所有图片 URL 下载失败",
+            error="All image URL downloads failed",
         )
 
 
@@ -555,25 +775,24 @@ def _normalize_image_query(query: str) -> str:
     q = re.sub(r"(?:\\[nrt]\d*|\\x[0-9a-fA-F]{2})+", " ", q)
     q = " ".join(q.strip().split())
     if not q:
-        raise ValueError("搜索关键词为空")
+        raise ValueError("搜索词无效：内容为空")
     if q.lower() in _GENERIC_IMAGE_QUERIES or q in _GENERIC_IMAGE_QUERIES:
-        raise ValueError(f"搜索关键词过于泛化: {q}")
+        raise ValueError(f"搜索词过于泛化：{q}")
     if re.fullmatch(r"[\d\s\W_]+", q):
-        raise ValueError(f"搜索关键词无效: {q}")
+        raise ValueError(f"搜索词无效：{q}")
     if len(q) < 2:
-        raise ValueError(f"搜索关键词过短: {q}")
+        raise ValueError(f"搜索词无效：过短 ({q})")
 
     # Enforce one visual intent per search call.
-    # If user passes multiple subjects (e.g. "花、瓶子、苹果"), caller should
-    # split into multiple search_images calls.
     multi_intent_parts = re.split(r"[、，,;/|+]+", q)
     non_empty_parts = [p.strip() for p in multi_intent_parts if p.strip()]
     if len(non_empty_parts) >= 2:
         raise ValueError(
-            "search_images 一次只支持一个主体关键词，请拆成多次调用"
+            "search_images supports one subject per call, split into multiple calls"
         )
 
     has_hint = any(h in q.lower() for h in _IMAGE_INTENT_HINTS)
     if not has_hint:
-        q = f"{q} 近照 高清 人像"
+        has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in q)
+        q = f"{q} 近照 高清 人像" if has_cjk else f"{q} photo hd portrait"
     return q

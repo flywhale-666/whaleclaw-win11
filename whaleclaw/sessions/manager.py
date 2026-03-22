@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -134,12 +135,12 @@ class SessionManager:
         *,
         tool_call_id: str | None = None,
         tool_name: str | None = None,
-        tool_calls: list[Any] | None = None,
+        tool_calls: Sequence[Any] | None = None,
     ) -> None:
         """Append a message to the session and persist it.
 
         Args:
-            tool_calls: Serialisable list of tool call dicts for assistant messages
+            tool_calls: Serialisable sequence of tool call dicts for assistant messages
                         (each dict: {id, name, arguments}).  Stored in message
                         metadata so they can be reconstructed on session reload.
         """

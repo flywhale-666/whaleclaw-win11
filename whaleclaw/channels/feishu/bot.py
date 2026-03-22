@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from whaleclaw.channels.feishu.allowlist import FeishuAllowList
 from whaleclaw.channels.feishu.card import FeishuCard
@@ -90,6 +90,29 @@ log = get_logger(__name__)
 _FEISHU_MEDIA_DIR = WHALECLAW_HOME / "media" / "feishu"
 _PENDING_IMAGE_PATHS_KEY = "feishu_pending_image_paths"
 _PENDING_PROMPT_KEY = "feishu_pending_prompt"
+_IMAGE_BUFFER_SKILL_IDS: frozenset[str] = frozenset({
+    "nano-banana-image-t8",
+    "xiaohongshu-publish",
+})
+
+
+def _skill_needs_image_buffer(skill_id: str) -> bool:
+    """Check if a skill needs image buffering via hooks, falling back to hardcoded set."""
+    if skill_id in _IMAGE_BUFFER_SKILL_IDS:
+        return True
+    try:
+        from whaleclaw.skills.hooks import get_skill_hooks
+        from whaleclaw.skills.parser import Skill
+
+        dummy = Skill(
+            id=skill_id, name=skill_id, instructions="", source_path=Path(".")
+        )
+        hooks = get_skill_hooks(dummy)
+        if hooks is not None:
+            return hooks.image_buffer_enabled
+    except Exception:
+        pass
+    return False
 
 
 @dataclass(slots=True)
@@ -173,12 +196,12 @@ class FeishuBot:
         self._dedup.mark(msg_id)
 
         raw_text = self.extract_text(message).strip()
-        inbound_images = (
+        inbound_images: list[_InboundImage] = (
             await self._extract_images(message)
             if msg_type in ("image", "post")
             else []
         )
-        images = [item.content for item in inbound_images]
+        images: list[ImageContent] = [item.content for item in inbound_images]
         image_markdown = self._build_image_markdown(inbound_images)
         file_path = await self._extract_file(message) if msg_type == "file" else None
         if not raw_text and not images and not file_path:
@@ -253,12 +276,16 @@ class FeishuBot:
                 if run_text is None:
                     return
                 text = run_text
-                images = run_images
+                images = run_images or []
 
-        await self._client.reply_message(
-            msg_id, "text", json.dumps({"text": "收到，处理中..."}, ensure_ascii=False)
+        reaction_id = ""
+        try:
+            reaction_id = await self._client.create_reaction(msg_id, "THINKING")
+        except Exception:
+            log.warning("feishu.reaction_create_failed", message_id=msg_id)
+        await self._run_agent_and_reply(
+            text, open_id, msg_id, images=images, reaction_id=reaction_id,
         )
-        await self._run_agent_and_reply(text, open_id, msg_id, images=images)
 
     async def _handle_pending_image_submission(
         self,
@@ -271,12 +298,29 @@ class FeishuBot:
         if self._session_manager is None:
             return None
 
-        metadata = dict(session.metadata) if isinstance(session.metadata, dict) else {}
+        metadata: dict[str, Any] = (
+            cast(dict[str, Any], session.metadata)
+            if isinstance(session.metadata, dict)
+            else {}
+        )
         pending_paths = [
             str(item).strip()
             for item in metadata.get(_PENDING_IMAGE_PATHS_KEY, [])
             if str(item).strip()
         ]
+
+        locked_ids: set[str] = set()
+        raw_locked = metadata.get("locked_skill_ids")
+        if isinstance(raw_locked, list):
+            locked_ids = {
+                str(x).strip().lower()
+                for x in raw_locked
+                if isinstance(x, str) and str(x).strip()
+            }
+        needs_buffer = any(_skill_needs_image_buffer(sid) for sid in locked_ids) or bool(pending_paths)
+        if not needs_buffer:
+            return None
+
         pending_prompt = str(metadata.get(_PENDING_PROMPT_KEY, "")).strip()
         stripped_text, submitted = self._strip_submit_suffix(raw_text)
 
@@ -369,6 +413,19 @@ class FeishuBot:
             return f"图{start}"
         return f"图{start}到图{end}"
 
+    async def _remove_reaction(self, msg_id: str, reaction_id: str) -> None:
+        """Best-effort removal of a temporary reaction."""
+        if not reaction_id:
+            return
+        try:
+            await self._client.delete_reaction(msg_id, reaction_id)
+        except Exception:
+            log.warning(
+                "feishu.reaction_delete_failed",
+                message_id=msg_id,
+                reaction_id=reaction_id,
+            )
+
     async def _run_agent_and_reply(
         self,
         text: str,
@@ -376,20 +433,23 @@ class FeishuBot:
         reply_to_msg_id: str,
         *,
         images: list[ImageContent] | None = None,
+        reaction_id: str = "",
     ) -> None:
         """Run Agent and send plain text/image/file replies to Feishu."""
         if not self._whaleclaw_config or not self._session_manager or not self._tool_registry:
+            await self._remove_reaction(reply_to_msg_id, reaction_id)
             await self._client.reply_message(
                 reply_to_msg_id, "text", json.dumps({"text": text}, ensure_ascii=False)
             )
             return
 
-        from whaleclaw.agent.loop import run_agent
+        from whaleclaw.agent.single_agent import run_agent
         from whaleclaw.gateway.protocol import make_message, make_status
         from whaleclaw.gateway.ws import broadcast_all
         from whaleclaw.providers.router import ModelRouter
 
         if self._compression_ready_fn is not None and not self._compression_ready_fn():
+            await self._remove_reaction(reply_to_msg_id, reaction_id)
             await self._client.reply_message(
                 reply_to_msg_id,
                 "text",
@@ -400,6 +460,7 @@ class FeishuBot:
         session = await self._session_manager.get_or_create("feishu", peer_id)
         cmd_reply = await self._handle_command(text, session)
         if cmd_reply is not None:
+            await self._remove_reaction(reply_to_msg_id, reaction_id)
             await self._client.reply_message(
                 reply_to_msg_id,
                 "text",
@@ -441,7 +502,7 @@ class FeishuBot:
                 registry=self._tool_registry,
                 images=images or None,
                 session_manager=self._session_manager,
-                session_store=self._session_manager._store,  # noqa: SLF001
+                session_store=self._session_manager.store,
                 memory_manager=self._memory_manager,
                 extra_memory=extra_memory,
                 trigger_event_id=reply_to_msg_id,
@@ -462,6 +523,7 @@ class FeishuBot:
                     )
             error_text = _format_exception_text(exc)
             log.exception("feishu.agent_error", error=error_text, model=session.model)
+            await self._remove_reaction(reply_to_msg_id, reaction_id)
             await self._client.reply_message(
                 reply_to_msg_id,
                 "text",
@@ -471,6 +533,7 @@ class FeishuBot:
             return
 
         if not reply.strip():
+            await self._remove_reaction(reply_to_msg_id, reaction_id)
             await self._client.reply_message(
                 reply_to_msg_id,
                 "text",
@@ -507,6 +570,8 @@ class FeishuBot:
                         ensure_ascii=False,
                     ),
                 )
+        finally:
+            await self._remove_reaction(reply_to_msg_id, reaction_id)
 
     async def _handle_command(self, text: str, session: Any) -> str | None:
         """Handle Feishu slash commands for model switching."""
@@ -560,7 +625,8 @@ class FeishuBot:
             if target not in models:
                 return f"模型不可用: {target}\n发送 /models 查看可选模型。"
 
-            await self._session_manager.update_model(session, target)
+            if self._session_manager is not None:
+                await self._session_manager.update_model(session, target)
             if self._whaleclaw_config is not None:
                 self._whaleclaw_config.agent.model = target
             try:
@@ -585,7 +651,11 @@ class FeishuBot:
             if action in {"status", "st", "s"}:
                 return self._format_multi_agent_status(session)
 
-            metadata = dict(session.metadata) if isinstance(session.metadata, dict) else {}
+            metadata: dict[str, Any] = (
+                cast(dict[str, Any], session.metadata)
+                if isinstance(session.metadata, dict)
+                else {}
+            )
 
             if action in {"on", "enable"}:
                 metadata["multi_agent_enabled"] = True
@@ -637,19 +707,22 @@ class FeishuBot:
         global_enabled = False
         global_mode = "parallel"
         global_rounds = 1
-        if self._whaleclaw_config is not None and isinstance(self._whaleclaw_config.plugins, dict):
+        if self._whaleclaw_config is not None:
             raw = self._whaleclaw_config.plugins.get("multi_agent", {})
-            if isinstance(raw, dict):
-                global_enabled = bool(raw.get("enabled", False))
-                mode_raw = str(raw.get("mode", "parallel")).strip().lower()
-                global_mode = mode_raw if mode_raw in {"parallel", "serial"} else "parallel"
-                try:
-                    global_rounds = int(raw.get("max_rounds", 1))
-                except Exception:
-                    global_rounds = 1
+            global_enabled = bool(raw.get("enabled", False))
+            mode_raw = str(raw.get("mode", "parallel")).strip().lower()
+            global_mode = mode_raw if mode_raw in {"parallel", "serial"} else "parallel"
+            try:
+                global_rounds = int(str(raw.get("max_rounds", 1)))
+            except (ValueError, TypeError):
+                global_rounds = 1
         global_rounds = max(1, min(global_rounds, 10))
 
-        metadata = session.metadata if isinstance(session.metadata, dict) else {}
+        metadata: dict[str, Any] = (
+            cast(dict[str, Any], session.metadata)
+            if isinstance(session.metadata, dict)
+            else {}
+        )
         has_enabled_override = isinstance(metadata.get("multi_agent_enabled"), bool)
         has_mode_override = str(metadata.get("multi_agent_mode", "")).strip().lower() in {
             "parallel",
@@ -669,7 +742,7 @@ class FeishuBot:
         )
         effective_rounds = global_rounds
         if has_rounds_override:
-            effective_rounds = int(metadata["multi_agent_max_rounds"])
+            effective_rounds = int(str(metadata["multi_agent_max_rounds"]))
         effective_rounds = max(1, min(effective_rounds, 10))
 
         mode_cn = "并行" if effective_mode == "parallel" else "串行"
@@ -777,6 +850,20 @@ class FeishuBot:
             clean_text = clean_text.replace(match.group(0), "")
         for md_str, label in file_replacements:
             clean_text = clean_text.replace(md_str, label)
+        # Remove lines that mention local file paths (backtick-wrapped or bare)
+        clean_text = re.sub(
+            r"[^\n]*(?:保存到|saved to|输出到|路径[为是：:])[^\n]*"
+            r"(?:[`\"]?[A-Za-z]:\\[^\n`\"]*[`\"]?|[`\"]?/(?:home|tmp|Users)[^\n`\"]*[`\"]?)[^\n]*",
+            "",
+            clean_text,
+        )
+        clean_text = re.sub(
+            r"[^\n]*`[^`]*(?:[A-Za-z]:\\|/home/|/tmp/|\.whaleclaw/)[^`]*`[^\n]*",
+            "",
+            clean_text,
+        )
+        # Collapse 2+ consecutive newlines into 1
+        clean_text = re.sub(r"\n{2,}", "\n", clean_text)
         return clean_text.strip(), image_paths, file_paths
 
     async def _send_image_to_peer(self, peer_id: str, image_path: Path) -> None:
@@ -823,10 +910,10 @@ class FeishuBot:
             return ""
 
         if msg_type == "text":
-            return content.get("text", "")
+            return str(content.get("text", ""))
         if msg_type == "post":
             parts: list[str] = []
-            blocks = content.get("content") or [[]]
+            blocks: list[list[dict[str, str]]] = content.get("content") or [[]]
             for line in blocks:
                 for elem in line:
                     if elem.get("tag") == "text":
@@ -834,7 +921,7 @@ class FeishuBot:
             return " ".join(parts)
         return ""
 
-    async def _extract_images(self, message: dict[str, Any]) -> list[ImageContent]:
+    async def _extract_images(self, message: dict[str, Any]) -> list[_InboundImage]:
         """Download incoming Feishu image(s) and convert to ImageContent.
 
         Supports both pure image messages (msg_type=image) and rich-text
@@ -844,17 +931,17 @@ class FeishuBot:
         msg_type = message.get("message_type", "")
         content_str = message.get("content", "{}")
         try:
-            content = json.loads(content_str)
+            content: dict[str, Any] = json.loads(content_str)
         except (json.JSONDecodeError, TypeError):
             return []
 
         image_keys: list[str] = []
         if msg_type == "image":
-            key = content.get("image_key", "")
+            key: str = content.get("image_key", "")
             if key:
                 image_keys.append(key)
         elif msg_type == "post":
-            blocks = content.get("content") or [[]]
+            blocks: list[list[dict[str, str]]] = content.get("content") or [[]]
             for line in blocks:
                 for elem in line:
                     if elem.get("tag") == "img" and elem.get("image_key"):

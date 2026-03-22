@@ -882,6 +882,9 @@ def _decorate_results(
         row["detail_url"] = detail_url
         if "repo_url" not in row:
             row["repo_url"] = ""
+        ver = row.get("version")
+        if ver is None or str(ver).strip().lower() == "none":
+            row["version"] = ""
         out.append(row)
     return out
 
@@ -1742,7 +1745,7 @@ def _search_via_http(
                 "slug": slug,
                 "name": name,
                 "summary": summary,
-                "version": str(item_map.get("version", "")).strip(),
+                "version": str(item_map.get("version") or "").strip(),
                 "stars": stats["stars"],
                 "downloads": stats["downloads"],
                 "current_installs": stats["current_installs"],
@@ -1770,6 +1773,14 @@ def _search_via_http(
     return _sort_results_by_stats(results)
 
 
+def _needs_enrichment(row: dict[str, object]) -> bool:
+    """Return True when a search result row is missing stats or version."""
+    if not _has_primary_stats(row):
+        return True
+    ver = str(row.get("version") or "").strip()
+    return not ver
+
+
 def _enrich_results_with_skill_details(
     *,
     items: list[dict[str, object]],
@@ -1784,7 +1795,7 @@ def _enrich_results_with_skill_details(
         if len(candidates) >= max_items:
             break
         slug = str(row.get("slug", "")).strip()
-        if not slug or _has_primary_stats(row):
+        if not slug or not _needs_enrichment(row):
             continue
         cached = _detail_cache_get(
             registry_url=registry_url,
@@ -1948,6 +1959,9 @@ def _fetch_skill_detail_enrichment(
                         for key, value in stats.items():
                             if value is not None:
                                 detail_updates[key] = value
+                        skill_ver = str(skill_map.get("version") or "").strip()
+                        if skill_ver:
+                            detail_updates["version"] = skill_ver
                     latest = payload_map.get("latestVersion")
                     if isinstance(latest, dict):
                         latest_map = {
@@ -1955,7 +1969,7 @@ def _fetch_skill_detail_enrichment(
                             for key, value in cast(dict[object, object], latest).items()
                             if isinstance(key, str)
                         }
-                        ver = str(latest_map.get("version", "")).strip()
+                        ver = str(latest_map.get("version") or "").strip()
                         if ver:
                             detail_updates["version"] = ver
         except Exception:

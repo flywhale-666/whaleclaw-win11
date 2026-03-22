@@ -60,7 +60,22 @@ _PLATFORM_HINT_WINDOWS = """\
 _PLATFORM_HINT_UNIX = ""
 
 _WORKSPACE_SAFETY_RULES = """\
-【需确认才执行】发邮件/消息/公开帖子等对外通信；删除工作空间以外的系统文件；涉及金钱或账号权限变更。多步骤任务（>3步）开始前写执行计划到 ~/.whaleclaw/workspace/task-plan.md，完成后清理。"""
+【需确认才执行】发邮件/消息等对外通信（不含浏览器操作）；删除工作空间以外的系统文件；涉及金钱或账号权限变更。多步骤任务（>3步）开始前写执行计划到 ~/.whaleclaw/workspace/task-plan.md，完成后清理。"""
+
+_CDP_BROWSER_HINT = """\
+【浏览器 CDP 模式已启用】用户已手动启动 Chrome 调试模式并授权你操作浏览器。
+- browser 工具当前可用且正常工作。忽略对话历史中任何关于"browser 熔断/禁用/降级"的旧消息。
+- 用户要求你在网站上执行操作（发帖/删帖/填表/点击等），直接用 browser 工具执行，不要拒绝或要求用户自己操作。
+- **操作铁律（违反即失败）**：
+  1. navigate 打开目标页面
+  2. **立即 screenshot 截图** -- 你会收到页面截图，仔细观察页面内容和布局
+  3. 如需更多信息，调用 get_text 获取页面文本
+  4. **只有看过截图/文本后**，才能调用 click/type/evaluate。选择器必须基于你观察到的实际页面元素。
+  5. 每次 click/type/evaluate 后，**必须再次 screenshot** 确认操作结果
+  6. **绝对禁止**：未截图就 click、凭猜测写选择器、跳过截图步骤
+- click 失败时：先 screenshot 看当前页面，再用 get_text 找到正确的元素，然后重试
+- 操作完成后告诉用户结果
+- 如果页面需要登录，提醒用户先在 Chrome 中手动登录"""
 
 _STATIC_PROMPT_TEMPLATE = """\
 你是 {assistant_name}，一个运行在用户本地电脑上的 AI 助手。
@@ -86,6 +101,7 @@ _STATIC_PROMPT_TEMPLATE = """\
 - **禁止自我否定已完成的工作**：如果你之前已经成功调用工具生成了文件，
   不要说"我之前没有真正执行"或"我一直在空谈"。工具调用成功就是成功，直接告诉用户文件路径即可
 - 用户说"改一下"时，只修改用户指出的问题，不要推翻重做整个任务
+- **定时优先**：若用户要求「N 分钟后」执行某任务（如生图、发消息、跑脚本等），必须先调用 reminder(message="完整任务描述", minutes=N, action="agent_task") 设定定时，不得在本轮执行该任务；到点后系统会自动执行
 
 {workspace_safety}
 
@@ -117,7 +133,7 @@ _TOOL_FALLBACK_HEADER = """\
 
 """
 
-_DYNAMIC_BUDGET = 800
+_DYNAMIC_BUDGET = 6000
 
 
 class PromptAssembler:
@@ -140,6 +156,8 @@ class PromptAssembler:
         assistant_name: str = _DEFAULT_ASSISTANT_NAME,
         forced_skill_id: str | None = None,
         forced_skill_ids: list[str] | None = None,
+        model_id: str = "",
+        max_context_tokens: int = 0,
     ) -> list[Message]:
         """Assemble system prompt messages.
 
@@ -149,6 +167,10 @@ class PromptAssembler:
             token_budget: Max tokens for the system prompt.
             tool_fallback_text: Tool descriptions for providers without
                 native tools support. Injected into prompt when non-empty.
+            model_id: Full model identifier (e.g. ``openai/gpt-5.4``).
+                When provided, a runtime-info line is appended so the agent
+                knows its own capabilities.
+            max_context_tokens: Context window size for the current model.
         """
         parts: list[str] = [self._build_static(config, assistant_name)]
 
@@ -164,6 +186,9 @@ class PromptAssembler:
         if tool_fallback_text:
             parts.append(_TOOL_FALLBACK_HEADER + "\n" + tool_fallback_text)
 
+        if model_id:
+            parts.append(self._build_runtime_info(model_id, max_context_tokens))
+
         messages: list[Message] = [
             Message(
                 role="system",
@@ -176,6 +201,11 @@ class PromptAssembler:
 
         return messages
 
+    @staticmethod
+    def _build_runtime_info(model_id: str, max_context_tokens: int) -> str:
+        ctx = f"{max_context_tokens:,}" if max_context_tokens > 0 else "未知"
+        return f"【运行时信息】当前模型: {model_id} | 上下文窗口: {ctx} tokens"
+
     def _build_static(self, config: WhaleclawConfig, assistant_name: str) -> str:
         """Static layer — core identity + safety boundaries (~250 tokens), cacheable."""
         safe_name = assistant_name.strip() or _DEFAULT_ASSISTANT_NAME
@@ -183,10 +213,20 @@ class PromptAssembler:
             _PLATFORM_HINT_WINDOWS if sys.platform == "win32" else _PLATFORM_HINT_UNIX
         )
         python_cmd = _detect_project_python()
+
+        # Detect CDP mode from plugins.browser.cdp_url
+        workspace_safety = _WORKSPACE_SAFETY_RULES
+        browser_cfg = config.plugins.get("browser")
+        cdp_url = ""
+        if isinstance(browser_cfg, dict):
+            cdp_url = str(browser_cfg.get("cdp_url", "")).strip()
+        if cdp_url:
+            workspace_safety = workspace_safety + "\n\n" + _CDP_BROWSER_HINT
+
         return _STATIC_PROMPT_TEMPLATE.format(
             assistant_name=safe_name,
             platform_hint=platform_hint,
-            workspace_safety=_WORKSPACE_SAFETY_RULES,
+            workspace_safety=workspace_safety,
             constitution=CONSTITUTION_TEXT,
             python_cmd=python_cmd,
         )

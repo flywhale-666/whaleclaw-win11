@@ -25,6 +25,7 @@ class MessageType(StrEnum):
     CANVAS_PUSH = "canvas_push"
     CANVAS_RESET = "canvas_reset"
     CANVAS_EVENT = "canvas_event"
+    AGENT_DONE = "agent_done"
 
 
 class WSMessage(BaseModel):
@@ -117,4 +118,25 @@ def make_canvas_reset(session_id: str) -> WSMessage:
         type=MessageType.CANVAS_RESET,
         session_id=session_id,
         payload={},
+    )
+
+
+def make_agent_done(
+    session_id: str,
+    *,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    llm_rounds: int,
+) -> WSMessage:
+    """Create an agent_done message with execution metadata."""
+    return WSMessage(
+        type=MessageType.AGENT_DONE,
+        session_id=session_id,
+        payload={
+            "model": model,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "llm_rounds": llm_rounds,
+        },
     )

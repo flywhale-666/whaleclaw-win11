@@ -21,7 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "gateway": {"port": 18666, "bind": "127.0.0.1", "verbose": False, "auth": {"mode": "none", "password": None}},
     "agent": {
         "model": "deepseek/deepseek-chat",
-        "max_tool_rounds": 25,
+        "max_tool_rounds": 50,
         "thinking_level": "off",
         "summarizer": {"model": "zhipu/glm-4.7-flash", "enabled": True},
     },
@@ -32,6 +32,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "qwen": {"api_key": None, "base_url": None},
         "zhipu": {"api_key": None, "base_url": None},
         "minimax": {"api_key": None, "base_url": None},
+        "xiaomi": {"api_key": None, "base_url": None},
         "moonshot": {"api_key": None, "base_url": None},
         "google": {"api_key": None, "base_url": None},
         "nvidia": {"api_key": None, "base_url": None},
@@ -57,7 +58,7 @@ MODEL_PRESETS: dict[str, list[tuple[str, str, str]]] = {
         ("claude-sonnet-4-20250514", "Claude Sonnet 4 (思考)", "medium"),
         ("claude-opus-4-20250514", "Claude Opus 4 (思考)", "high"),
     ],
-    "openai": [("gpt-5.2", "GPT-5.2", "off")],
+    "openai": [("gpt-5.4", "GPT-5.4", "off"), ("gpt-5.2", "GPT-5.2", "off")],
     "deepseek": [("deepseek-chat", "DeepSeek Chat", "off"), ("deepseek-reasoner", "DeepSeek Reasoner (思考)", "high")],
     "qwen": [("qwen3.5-plus", "Qwen 3.5 Plus", "off"), ("qwen3-max", "Qwen 3 Max", "off")],
     "zhipu": [
@@ -65,7 +66,12 @@ MODEL_PRESETS: dict[str, list[tuple[str, str, str]]] = {
         ("glm-4.7", "GLM-4.7", "off"),
         ("glm-5", "GLM-5", "off"),
     ],
-    "minimax": [("MiniMax-M2.5", "MiniMax M2.5", "off"), ("MiniMax-M2.1", "MiniMax M2.1", "off")],
+    "minimax": [
+        ("MiniMax-M2.7", "MiniMax M2.7", "off"),
+        ("MiniMax-M2.5", "MiniMax M2.5", "off"),
+        ("MiniMax-M2.1", "MiniMax M2.1", "off"),
+    ],
+    "xiaomi": [("mimo-v2-pro", "MiMo V2 Pro", "off")],
     "moonshot": [("kimi-k2.5", "Kimi K2.5", "off")],
     "google": [
         ("gemini-3-flash-preview", "Gemini 3 Flash", "off"),
@@ -88,7 +94,8 @@ DEFAULT_URLS = {
     "deepseek": "https://api.deepseek.com",
     "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "zhipu": "https://open.bigmodel.cn/api/paas/v4",
-    "minimax": "https://api.minimax.chat/v1",
+    "minimax": "https://api.minimaxi.com/v1",
+    "xiaomi": "https://api.xiaomimimo.com/v1",
     "moonshot": "https://api.moonshot.cn/v1",
     "google": "https://generativelanguage.googleapis.com/v1beta",
     "nvidia": "https://integrate.api.nvidia.com/v1",
@@ -249,7 +256,7 @@ def verify_api(provider: str, model: str, api_key: str, base_url: str, quiet: bo
             body = {"model": model, "input": "hi", "max_output_tokens": 5}
         else:
             url = f"{base_url}/chat/completions"
-            body = {"model": model, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+            body: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
 
     def _try(proxy: str | None) -> httpx.Response:
         kwargs: dict[str, Any] = {"timeout": 15}
@@ -270,6 +277,13 @@ def verify_api(provider: str, model: str, api_key: str, base_url: str, quiet: bo
                 print(f"  ✖ 无法连接 {base_url}")
             return False
 
+    if resp.status_code == 400 and "max_tokens" in body:
+        body.pop("max_tokens")
+        try:
+            resp = _try(proxy if needs_proxy else None)
+        except Exception:
+            pass
+
     if resp.status_code in (200, 201):
         if not quiet:
             print("  ✓ 验证成功")
@@ -283,7 +297,20 @@ def verify_api(provider: str, model: str, api_key: str, base_url: str, quiet: bo
         except Exception:
             pass
     if not quiet:
-        print(f"  ✖ 验证失败 ({resp.status_code})")
+        detail = ""
+        try:
+            err_body = resp.json()
+            err_msg = err_body.get("error", {})
+            if isinstance(err_msg, dict):
+                detail = err_msg.get("message", "")
+            elif isinstance(err_msg, str):
+                detail = err_msg
+        except Exception:
+            pass
+        if detail:
+            print(f"  ✖ 验证失败 ({resp.status_code}): {detail}")
+        else:
+            print(f"  ✖ 验证失败 ({resp.status_code})")
     return False
 
 
@@ -641,24 +668,26 @@ def configure_model() -> None:
     print("  3) 通义千问")
     print("  4) 智谱 GLM")
     print("  5) MiniMax")
-    print("  6) 月之暗面")
-    print("  7) Google")
-    print("  8) NVIDIA NIM")
-    print("  9) 自定义")
+    print("  6) 小米 MiMo")
+    print("  7) 月之暗面")
+    print("  8) Google")
+    print("  9) NVIDIA NIM")
+    print("  c) 自定义")
     print("  0) 返回\n")
-    ch = input("  选择提供商 [0-9]: ").strip()
+    ch = input("  选择提供商 [0-9/c]: ").strip().lower()
     mapping = {
         "1": ("anthropic", "Anthropic"),
         "3": ("qwen", "通义千问"),
         "4": ("zhipu", "智谱 GLM"),
         "5": ("minimax", "MiniMax"),
-        "6": ("moonshot", "月之暗面"),
-        "7": ("google", "Google"),
-        "8": ("nvidia", "NVIDIA NIM"),
+        "6": ("xiaomi", "小米 MiMo"),
+        "7": ("moonshot", "月之暗面"),
+        "8": ("google", "Google"),
+        "9": ("nvidia", "NVIDIA NIM"),
     }
     if ch == "2":
         configure_openai()
-    elif ch == "9":
+    elif ch == "c":
         configure_custom_provider()
     elif ch in mapping:
         provider, label = mapping[ch]

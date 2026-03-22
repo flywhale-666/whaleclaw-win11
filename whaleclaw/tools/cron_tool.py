@@ -27,52 +27,52 @@ class CronManageTool(Tool):
         return ToolDefinition(
             name="cron",
             description=(
-                "Manage scheduled tasks. "
-                "add: create a job (schedule_kind=at|cron|every). "
-                "list: show all jobs. remove: delete a job. trigger: run a job now."
+                "管理定时任务。"
+                "add：创建定时任务（schedule_kind=at 一次性 | cron 表达式 | every 固定间隔）。"
+                "list：查看所有定时任务。remove：删除定时任务。trigger：立即触发一个任务。"
             ),
             parameters=[
                 ToolParameter(
                     name="action",
                     type="string",
-                    description="Action to perform.",
+                    description="要执行的操作：list 查看、add 创建、remove 删除、trigger 立即触发。",
                     enum=["list", "add", "remove", "trigger"],
                 ),
                 ToolParameter(
                     name="name",
                     type="string",
-                    description="Job name (for add).",
+                    description="任务名称（用于 add）。",
                     required=False,
                 ),
                 ToolParameter(
                     name="message",
                     type="string",
-                    description="Message to deliver when job fires (for add).",
+                    description="任务触发时要发送的消息或要执行的指令（用于 add）。",
                     required=False,
                 ),
                 ToolParameter(
                     name="schedule_kind",
                     type="string",
-                    description="Schedule type: at (one-shot), cron (expression), every (interval).",
+                    description="调度类型：at（一次性，N 分钟后）、cron（cron 表达式）、every（固定间隔）。",
                     required=False,
                     enum=["at", "cron", "every"],
                 ),
                 ToolParameter(
                     name="minutes",
                     type="integer",
-                    description="For at: minutes from now. For every: interval in minutes.",
+                    description="at 类型：从现在起多少分钟后触发。every 类型：间隔多少分钟。",
                     required=False,
                 ),
                 ToolParameter(
                     name="cron_expr",
                     type="string",
-                    description="5-field cron expression, e.g. '0 7 * * *' (for schedule_kind=cron).",
+                    description="5 字段 cron 表达式，例如 '0 7 * * *'（用于 schedule_kind=cron）。",
                     required=False,
                 ),
                 ToolParameter(
                     name="job_id",
                     type="string",
-                    description="Job ID (for remove/trigger).",
+                    description="任务 ID（用于 remove/trigger）。",
                     required=False,
                 ),
             ],

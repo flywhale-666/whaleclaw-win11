@@ -78,17 +78,26 @@ class PptEditTool(Tool):
             description=(
                 "修改现有 PPT（.pptx）：支持文本替换、标题更新、商务风格、背景色、备注、"
                 "插图（add_image 新增图片；replace_image 替换已有图片，保持原位置尺寸；"
-                "remove_image 删除图片）；add_slide 在末尾追加新页。换图/替换封面图请用 replace_image。"
+                "remove_image 删除图片）；add_slide 在末尾追加新页；"
+                "delete_slide 删除指定页（至少保留 1 页）；"
+                "read_slide 读取指定页所有元素的文本/图片信息。"
+                "换图/替换封面图请用 replace_image。"
             ),
             parameters=[
                 ToolParameter(name="path", type="string", description="PPT 文件绝对路径"),
-                ToolParameter(name="slide_index", type="integer", description="页码（从 1 开始，add_slide 时可省略）"),
+                ToolParameter(
+                    name="slide_index",
+                    type="integer",
+                    description="页码（从 1 开始；add_slide 时可省略）",
+                    required=False,
+                ),
                 ToolParameter(
                     name="action",
                     type="string",
                     description=(
                         "操作类型：replace_text|set_title|set_notes|set_background"
-                        "|add_image|replace_image|remove_image|apply_business_style|add_slide"
+                        "|add_image|replace_image|remove_image|apply_business_style"
+                        "|add_slide|delete_slide|read_slide"
                     ),
                     required=False,
                     enum=[
@@ -101,6 +110,8 @@ class PptEditTool(Tool):
                         "remove_image",
                         "apply_business_style",
                         "add_slide",
+                        "delete_slide",
+                        "read_slide",
                     ],
                 ),
                 ToolParameter(
@@ -203,7 +214,65 @@ class PptEditTool(Tool):
         except Exception as exc:
             return ToolResult(success=False, output="", error=f"PPT 打开失败: {exc}")
 
-        # add_slide 不需要预先校验 slide_index 是否越界
+        # add_slide / delete_slide / read_slide 在越界检查前单独处理
+        if action == "delete_slide":
+            total = len(prs.slides)
+            if total <= 1:
+                return ToolResult(
+                    success=False, output="",
+                    error="PPT 只剩 1 页，无法删除（至少保留 1 页）",
+                )
+            if slide_index <= 0 or slide_index > total:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"页码越界: slide_index={slide_index}, 总页数={total}",
+                )
+            sldId = prs.slides._sldIdLst[slide_index - 1]  # pyright: ignore[reportPrivateUsage]
+            rId = sldId.rId
+            prs.part.drop_rel(rId)
+            prs.slides._sldIdLst.remove(sldId)  # pyright: ignore[reportPrivateUsage]
+            try:
+                prs.save(str(path))
+            except Exception as exc:
+                return ToolResult(success=False, output="", error=f"PPT 保存失败: {exc}")
+            return ToolResult(
+                success=True,
+                output=f"已删除 {path} 第 {slide_index} 页，剩余 {total - 1} 页",
+            )
+
+        if action == "read_slide":
+            total = len(prs.slides)
+            if slide_index <= 0 or slide_index > total:
+                return ToolResult(
+                    success=False, output="",
+                    error=f"页码越界: slide_index={slide_index}, 总页数={total}",
+                )
+            from pptx.enum.shapes import MSO_SHAPE_TYPE as _MSO  # noqa: N811
+
+            target = prs.slides[slide_index - 1]
+            elements: list[str] = []
+            for idx, shape in enumerate(target.shapes, 1):
+                shape_type = getattr(shape, "shape_type", None)
+                if shape_type == _MSO.PICTURE:
+                    img_name = getattr(shape.image, "content_type", "image")
+                    elements.append(f"  [{idx}] 图片 ({img_name})")
+                elif shape_type == _MSO.TABLE:
+                    rows = len(shape.table.rows)
+                    cols = len(shape.table.columns)
+                    elements.append(f"  [{idx}] 表格 ({rows}行×{cols}列)")
+                elif shape_type == _MSO.GROUP:
+                    elements.append(f"  [{idx}] 组合图形 (含 {len(shape.shapes)} 个子元素)")
+                else:
+                    text = getattr(shape, "text", "").strip()
+                    if text:
+                        preview = text[:80] + ("…" if len(text) > 80 else "")
+                        elements.append(f"  [{idx}] 文本: {preview}")
+                    else:
+                        elements.append(f"  [{idx}] 空元素 (类型={shape_type})")
+            header = f"第 {slide_index}/{total} 页，共 {len(target.shapes)} 个元素："
+            body = "\n".join(elements) if elements else "  （空白页，无任何元素）"
+            return ToolResult(success=True, output=f"{header}\n{body}")
+
         if action == "add_slide":
             from pptx.util import Inches, Pt  # noqa: F811
 

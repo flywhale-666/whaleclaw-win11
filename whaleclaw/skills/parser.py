@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # Bundled skills shipped with WhaleClaw — these must NOT trigger session lock.
 _BUNDLED_DIR = Path(__file__).resolve().parent / "bundled"
@@ -17,6 +17,8 @@ _BUNDLED_DIR = Path(__file__).resolve().parent / "bundled"
 class Skill(BaseModel):
     """Skill parsed from SKILL.md."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     id: str
     name: str
     triggers: list[str] = Field(default_factory=list)
@@ -24,11 +26,12 @@ class Skill(BaseModel):
     instructions: str
     tools: list[str] = Field(default_factory=list)
     examples: list[str] = Field(default_factory=list)
-    max_tokens: int = 800
+    max_tokens: int = 6000
     lock_session: bool = False
     param_guard: SkillParamGuard | None = None
     source_path: Path
     is_user_installed: bool = False
+    hooks: Any = None
 
 
 class SkillParamItem(BaseModel):
@@ -109,7 +112,7 @@ def _make_param_item_from_keyword(keyword: str, *, required: bool) -> SkillParam
     return None
 
 
-_PARAM_HINT_KEYWORDS = ("最小必填", "必填", "确认参数", "缺啥补啥", "缺少参数")
+_PARAM_HINT_KEYWORDS = ("最小必填", "必填", "确认参数", "缺啥补啥", "缺少参数", "可选")
 _PARAM_HINT_EXCLUDE = ("必须遵守", "必须使用", "必须包含", "必须保持", "必须在", "命令行参数")
 
 
@@ -163,7 +166,7 @@ class SkillParser:
             triggers = [str(t) for t in cast(list[Any], raw_triggers)]
         else:
             triggers = []
-        max_tokens = int(frontmatter.get("max_tokens") or 800)
+        max_tokens = int(frontmatter.get("max_tokens") or 6000)
         lock_session = bool(
             frontmatter.get("lock_session", frontmatter.get("conversation_lock", False))
         )

@@ -134,7 +134,10 @@ def with_round_version_suffix(path: str, round_no: int) -> str:
     stem = target.stem
     base_stem = VERSION_SUFFIX_RE.sub("", stem)
     target_name = f"{base_stem}_V{round_no}{target.suffix}"
-    return str(target.with_name(target_name))
+    result = str(target.with_name(target_name))
+    if "/" in path and "\\" in result:
+        result = result.replace("\\", "/")
+    return result
 
 
 def next_available_version_path(path: str) -> str:

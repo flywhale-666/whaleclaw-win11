@@ -105,11 +105,18 @@ def _mask_sensitive_query_values(text: str) -> str:
     return _SENSITIVE_QUERY_RE.sub(_replace, text)
 
 
+_NOISY_ACCESS_PATTERNS = re.compile(
+    r'"GET /api/(file-info|clawhub/auth-status|sessions/[^/\s]+|mcp/servers)\b'
+)
+
+
 class _SensitiveAccessLogFilter(logging.Filter):
-    """Mask sensitive query values in uvicorn access logs."""
+    """Mask sensitive query values and suppress noisy polling endpoints."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
+        if _NOISY_ACCESS_PATTERNS.search(msg):
+            return False
         masked = _mask_sensitive_query_values(msg)
         if masked != msg:
             record.msg = masked

@@ -29,10 +29,15 @@ class TestPermissionChecker:
         assert PermissionChecker.check_tool("bash", policy) is False
 
     def test_check_path_denied(self) -> None:
+        import sys
         policy = SecurityPolicy()
-        assert PermissionChecker.check_path("/etc/passwd", policy) is False
-        assert PermissionChecker.check_path("/var/log/syslog", policy) is False
         assert PermissionChecker.check_path("~/.ssh/id_rsa", policy) is False
+        if sys.platform == "win32":
+            assert PermissionChecker.check_path("C:\\Windows\\System32\\config", policy) is False
+            assert PermissionChecker.check_path("C:\\Program Files\\secret.dll", policy) is False
+        else:
+            assert PermissionChecker.check_path("/etc/passwd", policy) is False
+            assert PermissionChecker.check_path("/var/log/syslog", policy) is False
 
     def test_check_command_dangerous(self) -> None:
         policy = SecurityPolicy()

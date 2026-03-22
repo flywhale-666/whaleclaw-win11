@@ -34,7 +34,12 @@ max_tokens: 500
 
 ### reminder — 一次性提醒
 
-- `reminder(message="提醒内容", minutes=30)` — N 分钟后提醒
+- `reminder(message="提醒内容", minutes=30)` — N 分钟后发一条提醒消息（默认）
+- `reminder(message="完整任务描述", minutes=N, action="agent_task")` — N 分钟后由 Agent 执行该任务（生图、发消息、跑脚本等）
+
+**铁律（必须遵守）**：当用户说「N 分钟后」再做某任务（例如「5 分钟后用香蕉生图画一只龙」「10 分钟后提醒我开会」）时：
+1. **必须先**在本轮**仅**调用 `reminder(message="用户说的完整任务内容", minutes=N, action="agent_task")`（若只是提醒一句话则用默认 `action="message"` 即可）。
+2. **不得在本轮**执行该任务本身（不要在本轮调用生图、发消息、bash 等工具去完成该任务）。定时到点后系统会自动把「任务内容」当作新消息让 Agent 执行。
 
 ## 示例
 
@@ -43,6 +48,9 @@ max_tokens: 500
 
 用户: "30 分钟后提醒我开会"
 → `reminder(message="该开会了", minutes=30)`
+
+用户: "5 分钟后用香蕉生图，画一只喷火龙，比例 3:4"
+→ 只调用 `reminder(message="使用香蕉生图，画一只喷火龙，比例3:4", minutes=5, action="agent_task")`，不要在本轮生图。
 
 ## 工具
 

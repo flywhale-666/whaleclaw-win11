@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
+import importlib.util
 import os
 import shutil
 import socket
@@ -21,6 +23,29 @@ log = get_logger(__name__)
 _BUNDLED_DIR = Path(__file__).resolve().parent / "bundled"
 _USER_SKILLS_DIR = WORKSPACE_DIR / "skills"
 _DEFAULT_SKILLS_DIRS = [_BUNDLED_DIR, _USER_SKILLS_DIR]
+
+
+def _load_hooks(skill: Skill) -> None:
+    """Try to load hooks.py from the skill directory and attach to skill.hooks."""
+    hooks_path = skill.source_path.parent / "hooks.py"
+    if not hooks_path.is_file():
+        return
+    module_name = f"whaleclaw.skills._hooks_{skill.id.replace('-', '_')}"
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, hooks_path)
+        if spec is None or spec.loader is None:
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        hooks_cls = getattr(module, "Hooks", None)
+        if hooks_cls is not None:
+            hooks_instance = hooks_cls(skill)
+            skill.hooks = hooks_instance
+            from whaleclaw.skills.hooks import register_skill_hooks
+            register_skill_hooks(skill.id, hooks_instance)
+            log.info("skill.hooks_loaded", skill_id=skill.id)
+    except Exception as exc:
+        log.warning("skill.hooks_load_failed", skill_id=skill.id, error=str(exc))
 
 
 def _estimate_tokens(text: str) -> int:
@@ -53,7 +78,9 @@ class SkillManager:
                 continue
             for path in d.rglob("SKILL.md"):
                 with contextlib.suppress(Exception):
-                    skills.append(self._parser.parse(path))
+                    skill = self._parser.parse(path)
+                    _load_hooks(skill)
+                    skills.append(skill)
         return skills
 
     def get_routed_skills(

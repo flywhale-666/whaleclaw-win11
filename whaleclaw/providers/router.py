@@ -13,6 +13,7 @@ from whaleclaw.providers.nvidia import NvidiaProvider
 from whaleclaw.providers.openai import OpenAIProvider
 from whaleclaw.providers.openai_compat import OpenAICompatProvider
 from whaleclaw.providers.qwen import QwenProvider
+from whaleclaw.providers.xiaomi import XiaomiProvider
 from whaleclaw.providers.zhipu import ZhipuProvider
 from whaleclaw.types import ProviderError, StreamCallback
 from whaleclaw.utils.log import get_logger
@@ -26,6 +27,7 @@ _PROVIDER_MAP: dict[str, type[LLMProvider]] = {
     "qwen": QwenProvider,
     "zhipu": ZhipuProvider,
     "minimax": MiniMaxProvider,
+    "xiaomi": XiaomiProvider,
     "moonshot": MoonshotProvider,
     "google": GoogleProvider,
     "nvidia": NvidiaProvider,

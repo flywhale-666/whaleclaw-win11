@@ -14,7 +14,7 @@ class MessageDedup:
 
     def _evict(self) -> None:
         now = time.monotonic()
-        expired = [k for k, t in self._seen.items() if now - t > self._ttl]
+        expired = [k for k, t in self._seen.items() if now - t >= self._ttl]
         for k in expired:
             del self._seen[k]
 
