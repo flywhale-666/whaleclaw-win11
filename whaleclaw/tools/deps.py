@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import locale
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,28 @@ _PROJECT_PYTHON_CANDIDATES = (
     _PROJECT_ROOT / "python" / "bin" / "python3",
 )
 _PROJECT_PYTHON = next((p for p in _PROJECT_PYTHON_CANDIDATES if p.is_file()), None)
+
+
+def _decode_subprocess_output(data: bytes | str | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    encodings = ["utf-8"]
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        preferred_lower = preferred.lower()
+        if preferred_lower not in {enc.lower() for enc in encodings}:
+            encodings.append(preferred)
+    for fallback in ("gb18030", "gbk"):
+        if fallback not in {enc.lower() for enc in encodings}:
+            encodings.append(fallback)
+    for encoding in encodings:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _get_pip() -> list[str]:
@@ -58,14 +81,13 @@ def ensure_package(
         result = subprocess.run(
             [*pip_cmd, "install", pkg],
             capture_output=True,
-            text=True,
             timeout=120,
         )
         if result.returncode != 0:
             log.warning(
                 "deps.install_failed",
                 package=pkg,
-                stderr=result.stderr[:500],
+                stderr=_decode_subprocess_output(result.stderr)[:500],
             )
             return False
         log.info("deps.installed", package=pkg)
@@ -79,7 +101,6 @@ def ensure_package(
             subprocess.run(
                 [python, "-m", *post_install_hook.split()],
                 capture_output=True,
-                text=True,
                 timeout=120,
             )
         except Exception as exc:

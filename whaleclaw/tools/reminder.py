@@ -74,8 +74,8 @@ class ReminderTool(Tool):
         if minutes < 1:
             return ToolResult(success=False, output="", error="minutes 必须大于 0")
 
-        raw_action = str(kwargs.get("action", "message")).strip().lower()
-        action_type: str = "agent" if raw_action == "agent_task" else "message"
+        raw_action = str(kwargs.get("action", "agent_task")).strip().lower()
+        action_type: str = "agent" if raw_action != "message" else "message"
 
         now = datetime.now()
         target = now + timedelta(minutes=minutes)

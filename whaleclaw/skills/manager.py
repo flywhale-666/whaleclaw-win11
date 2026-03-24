@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import importlib.util
+import locale
 import os
 import shutil
 import socket
@@ -23,6 +24,28 @@ log = get_logger(__name__)
 _BUNDLED_DIR = Path(__file__).resolve().parent / "bundled"
 _USER_SKILLS_DIR = WORKSPACE_DIR / "skills"
 _DEFAULT_SKILLS_DIRS = [_BUNDLED_DIR, _USER_SKILLS_DIR]
+
+
+def _decode_subprocess_output(data: bytes | str | None) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    encodings = ["utf-8"]
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        preferred_lower = preferred.lower()
+        if preferred_lower not in {enc.lower() for enc in encodings}:
+            encodings.append(preferred)
+    for fallback in ("gb18030", "gbk"):
+        if fallback not in {enc.lower() for enc in encodings}:
+            encodings.append(fallback)
+    for encoding in encodings:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 def _load_hooks(skill: Skill) -> None:
@@ -230,12 +253,12 @@ class SkillManager:
             result = subprocess.run(
                 ["git", "clone", "--depth=1", clone_url, str(tmp_dir / "repo")],
                 capture_output=True,
-                text=True,
                 timeout=60,
                 env=self._git_env(),
             )
             if result.returncode != 0:
-                raise RuntimeError(f"git clone 失败: {result.stderr.strip()}")
+                stderr = _decode_subprocess_output(result.stderr).strip()
+                raise RuntimeError(f"git clone 失败: {stderr}")
 
             src = tmp_dir / "repo"
             if sub_path:

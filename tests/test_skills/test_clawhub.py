@@ -8,6 +8,12 @@ from pathlib import Path
 from whaleclaw.skills import clawhub
 
 
+def test_decode_subprocess_output_supports_gbk() -> None:
+    text = "缺少 API key，请通过 --api-key 提供"
+    decoded = clawhub._decode_subprocess_output(text.encode("gbk"))
+    assert decoded == text
+
+
 def test_search_skills_uses_http_search_and_http_detail(monkeypatch) -> None:  # noqa: ANN001
     clawhub._search_cache.clear()
     clawhub._detail_cache.clear()

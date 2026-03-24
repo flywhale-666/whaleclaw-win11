@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import html
 import json
+import locale
 import mimetypes
 import os
 import platform
@@ -79,6 +80,49 @@ _browser_login_lock = threading.Lock()
 
 class ClawHubCliError(RuntimeError):
     """Raised when ClawHub CLI command execution fails."""
+
+
+def _decode_subprocess_output(data: bytes | str | None) -> str:
+    """Decode subprocess output across UTF-8 and Windows local code pages."""
+    if data is None:
+        return ""
+    if isinstance(data, str):
+        return data
+    encodings = ["utf-8"]
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        preferred_lower = preferred.lower()
+        if preferred_lower not in {enc.lower() for enc in encodings}:
+            encodings.append(preferred)
+    for fallback in ("gb18030", "gbk"):
+        if fallback not in {enc.lower() for enc in encodings}:
+            encodings.append(fallback)
+    for encoding in encodings:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _run_subprocess(
+    args: list[str],
+    *,
+    env: dict[str, str],
+    timeout: int,
+) -> tuple[int, str, str]:
+    """Run subprocess without text mode to avoid Windows decode crashes."""
+    proc = subprocess.run(
+        args,
+        capture_output=True,
+        timeout=timeout,
+        env=env,
+    )
+    return (
+        proc.returncode,
+        _decode_subprocess_output(proc.stdout).strip(),
+        _decode_subprocess_output(proc.stderr).strip(),
+    )
 
 
 def is_clawhub_cli_available() -> bool:
@@ -401,17 +445,11 @@ def _run(args: list[str], *, env: dict[str, str]) -> str:
         raise ClawHubCliError("clawhub CLI not found")
     if args and args[0] == "clawhub":
         args = [bin_path, *args[1:]]
-    proc = subprocess.run(
-        args,
-        capture_output=True,
-        text=True,
-        timeout=45,
-        env=env,
-    )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout).strip() or "unknown clawhub error"
+    returncode, stdout, stderr = _run_subprocess(args, env=env, timeout=45)
+    if returncode != 0:
+        err = stderr or stdout or "unknown clawhub error"
         raise ClawHubCliError(err)
-    return (proc.stdout or "").strip()
+    return stdout
 
 
 def install_clawhub_cli() -> dict[str, str]:
@@ -429,15 +467,13 @@ def install_clawhub_cli() -> dict[str, str]:
     path_parts = [str(prefix_dir / "bin"), str(local_node_bin), env.get("PATH", "")]
     env["PATH"] = ":".join(p for p in path_parts if p)
 
-    proc = subprocess.run(
+    returncode, stdout, stderr = _run_subprocess(
         [npm_bin, "i", "-g", "clawhub", "--prefix", str(prefix_dir)],
-        capture_output=True,
-        text=True,
-        timeout=240,
         env=env,
+        timeout=240,
     )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout).strip() or "unknown install error"
+    if returncode != 0:
+        err = stderr or stdout or "unknown install error"
         raise ClawHubCliError(f"install failed: {err}")
 
     status = get_clawhub_cli_status()
@@ -446,7 +482,7 @@ def install_clawhub_cli() -> dict[str, str]:
     return {
         "path": str(status["path"]),
         "version": str(status["version"]),
-        "output": (proc.stdout or "").strip(),
+        "output": stdout,
     }
 
 
@@ -485,15 +521,13 @@ def login_clawhub_cli(
         workspace_dir=workspace_dir,
         api_token=api_token,
     )
-    proc = subprocess.run(
+    returncode, stdout, stderr = _run_subprocess(
         [_resolve_clawhub_bin() or "clawhub", "login"],
-        capture_output=True,
-        text=True,
-        timeout=180,
         env=env,
+        timeout=180,
     )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout).strip() or "login failed"
+    if returncode != 0:
+        err = stderr or stdout or "login failed"
         raise ClawHubCliError(_clean_cli_error(err))
     status = get_clawhub_auth_status(
         registry_url=registry_url,
@@ -503,7 +537,7 @@ def login_clawhub_cli(
     return {
         "ok": bool(status["logged_in"]),
         "message": str(status["message"]),
-        "output": (proc.stdout or "").strip(),
+        "output": stdout,
     }
 
 
@@ -521,15 +555,13 @@ def logout_clawhub_cli(
         workspace_dir=workspace_dir,
         api_token=api_token,
     )
-    proc = subprocess.run(
+    returncode, stdout, stderr = _run_subprocess(
         [_resolve_clawhub_bin() or "clawhub", "logout"],
-        capture_output=True,
-        text=True,
-        timeout=120,
         env=env,
+        timeout=120,
     )
-    if proc.returncode != 0:
-        err = _clean_cli_error((proc.stderr or proc.stdout).strip() or "logout failed")
+    if returncode != 0:
+        err = _clean_cli_error((stderr or stdout or "logout failed"))
         if "not logged in" not in err.lower():
             raise ClawHubCliError(err)
 
@@ -541,7 +573,7 @@ def logout_clawhub_cli(
     return {
         "ok": not bool(status["logged_in"]),
         "message": "logged out" if not bool(status["logged_in"]) else str(status["message"]),
-        "output": (proc.stdout or "").strip(),
+        "output": stdout,
     }
 
 

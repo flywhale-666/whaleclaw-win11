@@ -176,7 +176,7 @@ class CronManageTool(Tool):
             name=auto_name,
             schedule_obj=sched,
             action=CronAction(
-                type="message",
+                type="agent",
                 target=self.current_session_id or "user",
                 payload={"text": message},
             ),
