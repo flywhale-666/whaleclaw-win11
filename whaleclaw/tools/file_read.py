@@ -41,6 +41,13 @@ def _normalize_path(raw_path: str) -> Path:
     return Path(raw_path).expanduser().resolve()
 
 
+def _check_path_allowed(p: Path, *, write: bool = False) -> bool:
+    """Check path against denied_paths from the default SecurityPolicy."""
+    from whaleclaw.security.permissions import PermissionChecker, SecurityPolicy
+
+    return PermissionChecker.check_path(str(p), SecurityPolicy(), write=write)
+
+
 class FileReadTool(Tool):
     """Read file contents, optionally with line range."""
 
@@ -77,6 +84,8 @@ class FileReadTool(Tool):
             return ToolResult(success=False, output="", error="文件路径为空")
 
         p = _normalize_path(file_path)
+        if not _check_path_allowed(p):
+            return ToolResult(success=False, output="", error=f"安全策略拦截: 禁止访问 {p}")
         if not p.is_file():
             return ToolResult(success=False, output="", error=f"文件不存在: {p}")
 

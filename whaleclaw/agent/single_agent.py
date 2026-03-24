@@ -137,6 +137,9 @@ from whaleclaw.agent.helpers.tool_execution import (
     execute_tool as _execute_tool,
 )
 from whaleclaw.agent.helpers.tool_execution import (
+    diagnose_failure_hint as _diagnose_failure_hint,
+)
+from whaleclaw.agent.helpers.tool_execution import (
     format_tool_output as _format_tool_output,
 )
 from whaleclaw.agent.helpers.tool_execution import (
@@ -1364,6 +1367,24 @@ async def run_agent(
                     missing_any = missing_any or missing
                 session.metadata["skill_param_state"] = state_map
                 metadata_dirty = True
+                for skill in guards:
+                    _skill_hooks = _get_skill_hooks(skill)
+                    if (
+                        _skill_hooks is not None
+                        and _skill_hooks.is_control_message(llm_message)
+                        and not _skill_hooks.is_activation_message(llm_message)
+                    ):
+                        ctrl_state = state_map.get(skill.id, {})
+                        ctrl_reply = _skill_hooks.handle_control_message(
+                            llm_message, ctrl_state, session,
+                        )
+                        if ctrl_reply is not None:
+                            if session_manager is not None:
+                                await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                                    session.id,
+                                    metadata=session.metadata,
+                                )
+                            return ctrl_reply
                 if missing_any:
                     if session_manager is not None:
                         await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
@@ -1394,9 +1415,20 @@ async def run_agent(
                                 summarizer_model=summarizer_cfg.model,
                             )
                     return "\n\n".join(blocks)
-                # nano-banana 技能：记录本轮 mode/input_paths 到 session 供后续使用，
-                # 但不走固定执行路径——让 LLM 通过 system_messages 中注入的推荐命令
-                # 自主决定何时调用 bash，从而支持复合任务编排。
+                for skill in guards:
+                    _skill_hooks = _get_skill_hooks(skill)
+                    if _skill_hooks is not None and _skill_hooks.is_control_message(llm_message):
+                        ctrl_state = state_map.get(skill.id, {})
+                        ctrl_reply = _skill_hooks.handle_control_message(
+                            llm_message, ctrl_state, session,
+                        )
+                        if ctrl_reply is not None:
+                            if session_manager is not None:
+                                await session_manager._store.update_session_field(  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                                    session.id,
+                                    metadata=session.metadata,
+                                )
+                            return ctrl_reply
                 if (
                     "nano-banana-image-t8" in locked_skill_ids
                     and not _is_clearly_unrelated_to_image(llm_message)
@@ -2390,7 +2422,20 @@ async def run_agent(
                 ):
                     metadata_dirty = True
 
-            tool_output = _format_tool_output(result, tc.name)
+            raw_output = result.output or ""
+            raw_error = result.error or ""
+            if result.success:
+                tool_output = raw_output if raw_output.strip() else "(empty output)"
+            else:
+                parts: list[str] = []
+                if raw_error.strip():
+                    parts.append(raw_error)
+                if raw_output.strip() and raw_output.strip() != raw_error.strip():
+                    parts.append(raw_output)
+                diagnosis = _diagnose_failure_hint(result)
+                if diagnosis:
+                    parts.append(f"[DIAGNOSIS] {diagnosis}")
+                tool_output = "\n".join(parts) if parts else "unknown error"
 
             if native_tools:
                 tool_msg = Message(
@@ -2406,8 +2451,9 @@ async def run_agent(
             _dedup_consecutive_tool_errors(conversation, tool_output, tc.name)
             conversation.append(tool_msg)
 
+            persist_snippet = _format_tool_output(result, tc.name)
             if session_manager and session and not _is_transient_cli_usage_error(result):
-                snippet = tool_output[:500] if len(tool_output) > 500 else tool_output
+                snippet = persist_snippet[:500] if len(persist_snippet) > 500 else persist_snippet
                 await _persist_message(
                     session_manager,
                     session,

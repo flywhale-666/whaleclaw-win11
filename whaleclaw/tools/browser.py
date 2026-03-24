@@ -34,6 +34,72 @@ _DOWNLOAD_DIR = WHALECLAW_HOME / "downloads"
 
 _VIEWPORT = {"width": 1280, "height": 800}
 _TIMEOUT = 15_000
+_MAX_INTERACTIVE_ITEMS = 30
+
+_EXTRACT_INTERACTIVE_JS = """
+() => {
+    const items = [];
+    const seen = new Set();
+    const vw = window.innerWidth, vh = window.innerHeight;
+
+    function isVisible(el) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 5 || r.height < 5) return false;
+        const style = getComputedStyle(el);
+        return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+    }
+
+    function inViewport(el) {
+        const r = el.getBoundingClientRect();
+        return r.top < vh * 2 && r.bottom > -vh && r.left < vw && r.right > 0;
+    }
+
+    function textOf(el) {
+        return (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+    }
+
+    // Links
+    for (const a of document.querySelectorAll('a[href]')) {
+        if (!isVisible(a) || !inViewport(a)) continue;
+        const text = textOf(a);
+        if (!text || text.length < 2) continue;
+        const key = text.slice(0, 40);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        items.push({tag: 'a', text: text, href: (a.href || '').slice(0, 200)});
+        if (items.length >= MAX_ITEMS) break;
+    }
+
+    // Buttons
+    if (items.length < MAX_ITEMS) {
+        for (const btn of document.querySelectorAll('button, [role="button"], input[type="submit"]')) {
+            if (!isVisible(btn) || !inViewport(btn)) continue;
+            const text = textOf(btn) || btn.value || btn.getAttribute('aria-label') || '';
+            if (!text || text.length < 1) continue;
+            const key = 'btn:' + text.slice(0, 40);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            items.push({tag: 'button', text: text.slice(0, 80)});
+            if (items.length >= MAX_ITEMS) break;
+        }
+    }
+
+    // Inputs
+    if (items.length < MAX_ITEMS) {
+        for (const inp of document.querySelectorAll('input:not([type="hidden"]), textarea, select')) {
+            if (!isVisible(inp) || !inViewport(inp)) continue;
+            const ph = inp.placeholder || inp.getAttribute('aria-label') || inp.name || '';
+            const key = 'inp:' + (ph || inp.type || 'input');
+            if (seen.has(key)) continue;
+            seen.add(key);
+            items.push({tag: inp.tagName.toLowerCase(), type: inp.type || '', placeholder: ph.slice(0, 60)});
+            if (items.length >= MAX_ITEMS) break;
+        }
+    }
+
+    return items;
+}
+""".replace("MAX_ITEMS", str(_MAX_INTERACTIVE_ITEMS))
 _GENERIC_IMAGE_QUERIES = {
     "图",
     "图片",
@@ -358,16 +424,21 @@ class BrowserTool(Tool):
             name="browser",
             description=(
                 "Control a real Chrome browser. Actions: "
-                "navigate(url) -- open URL; "
+                "navigate(url) -- open URL (returns page interactive elements); "
                 "screenshot -- capture current page; "
-                "click(selector) -- click element; "
+                "click(selector) -- click element (supports CSS selectors and "
+                "Playwright text selectors like 'text=Click me'); "
                 "type(selector, text) -- type into input; "
                 "get_text(selector?) -- extract page/element text; "
                 "evaluate(script) -- run JavaScript; "
                 "search_images(query) -- image search and download one image per query; "
                 "upload(selector, file_paths) -- upload files to a file input element; "
                 "back -- go back; "
-                "close -- close browser."
+                "close -- close browser. "
+                "IMPORTANT: navigate returns clickable elements on the page. "
+                "Use the listed text content to build selectors. "
+                "On search engine pages, links use redirect URLs so always "
+                "prefer text selectors (e.g. 'text=文章标题') over href selectors."
             ),
             parameters=[
                 ToolParameter(
@@ -386,7 +457,11 @@ class BrowserTool(Tool):
                 ToolParameter(
                     name="selector",
                     type="string",
-                    description="CSS selector for click/type/get_text/upload.",
+                    description=(
+                        "CSS selector or Playwright text selector for click/type/get_text/upload. "
+                        "Examples: 'text=登录' (by visible text), '#submit-btn' (by id), "
+                        "'.search-result a' (by class). Prefer text selectors on search result pages."
+                    ),
                     required=False,
                 ),
                 ToolParameter(
@@ -476,17 +551,48 @@ class BrowserTool(Tool):
             log.error("browser.error", action=action, error=str(exc))
             return ToolResult(success=False, output="", error=str(exc))
 
+    async def _extract_interactive_summary(self, page: Any) -> str:
+        """Extract visible interactive elements from the page for LLM context."""
+        try:
+            items: list[dict[str, str]] = await page.evaluate(_EXTRACT_INTERACTIVE_JS)
+        except Exception:
+            return ""
+        if not items:
+            return ""
+        lines: list[str] = []
+        for item in items:
+            tag = item.get("tag", "")
+            text = item.get("text", "")
+            if tag == "a":
+                href = item.get("href", "")
+                lines.append(f"  [link] \"{text}\" -> {href}")
+            elif tag == "button":
+                lines.append(f"  [button] \"{text}\"")
+            else:
+                inp_type = item.get("type", "")
+                placeholder = item.get("placeholder", "")
+                label = placeholder or inp_type or tag
+                lines.append(f"  [input:{inp_type}] placeholder=\"{label}\"")
+        return "\n".join(lines)
+
     async def _dispatch(self, page: Any, action: str, kwargs: dict[str, Any]) -> ToolResult:
         if action == "navigate":
             url = kwargs.get("url", "")
             if not url:
                 return ToolResult(success=False, output="", error="url is empty")
             await page.goto(url, timeout=_TIMEOUT, wait_until="domcontentloaded")
+            await page.wait_for_timeout(800)
             title = await page.title()
-            return ToolResult(
-                success=True,
-                output=f"Navigated to: {url}\nTitle: {title}",
-            )
+            summary = await self._extract_interactive_summary(page)
+            output = f"Navigated to: {url}\nTitle: {title}"
+            if summary:
+                output += (
+                    f"\n\nInteractive elements on page:\n{summary}"
+                    "\n\nTip: use text content (e.g. selector='text=链接文字') "
+                    "to click links, especially on search engine result pages "
+                    "where href is a redirect URL."
+                )
+            return ToolResult(success=True, output=output)
 
         elif action == "screenshot":
             return await self._screenshot(page)
@@ -495,8 +601,24 @@ class BrowserTool(Tool):
             selector = kwargs.get("selector", "")
             if not selector:
                 return ToolResult(success=False, output="", error="selector is empty")
-            await page.click(selector, timeout=_TIMEOUT)
-            return ToolResult(success=True, output=f"Clicked: {selector}")
+            try:
+                await page.click(selector, timeout=_TIMEOUT)
+                return ToolResult(success=True, output=f"Clicked: {selector}")
+            except Exception as click_exc:
+                summary = await self._extract_interactive_summary(page)
+                ss = await self._screenshot(page)
+                error_msg = str(click_exc)
+                hint = f"Click failed: {error_msg}"
+                if summary:
+                    hint += (
+                        f"\n\nAvailable clickable elements:\n{summary}"
+                        "\n\nTip: use text content (e.g. selector='text=链接文字') "
+                        "instead of href-based selectors on search result pages."
+                    )
+                if ss.success:
+                    hint += f"\n\nPage screenshot: {ss.output}"
+                log.error("browser.click_failed", selector=selector, error=error_msg)
+                return ToolResult(success=False, output=hint, error=error_msg)
 
         elif action == "type":
             selector = kwargs.get("selector", "")

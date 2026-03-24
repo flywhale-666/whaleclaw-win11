@@ -8,6 +8,13 @@ from typing import Any
 from whaleclaw.tools.base import Tool, ToolDefinition, ToolParameter, ToolResult
 
 
+def _check_path_allowed(p: Path, *, write: bool = False) -> bool:
+    """Check path against denied_paths from the default SecurityPolicy."""
+    from whaleclaw.security.permissions import PermissionChecker, SecurityPolicy
+
+    return PermissionChecker.check_path(str(p), SecurityPolicy(), write=write)
+
+
 class FileEditTool(Tool):
     """Replace an exact string in a file."""
 
@@ -41,6 +48,8 @@ class FileEditTool(Tool):
             return ToolResult(success=False, output="", error="old_string 为空")
 
         p = Path(file_path).expanduser().resolve()
+        if not _check_path_allowed(p, write=True):
+            return ToolResult(success=False, output="", error=f"安全策略拦截: 禁止编辑 {p}")
         if not p.is_file():
             return ToolResult(success=False, output="", error=f"文件不存在: {p}")
 

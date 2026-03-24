@@ -56,14 +56,26 @@ for lv, (sz, clr, sp) in enumerate([
     h.font.name='Microsoft YaHei'; h.font.size=sz; h.font.color.rgb=clr; h.font.bold=True
     h.paragraph_format.space_before=sp
     h._element.rPr.rFonts.set(qn('w:eastAsia'), 'Microsoft YaHei')
+
+def set_run_font(run, size=None, bold=None, color=None, name='Microsoft YaHei'):
+    run.font.name = name
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), name)
+    if size is not None: run.font.size = size
+    if bold is not None: run.font.bold = bold
+    if color is not None: run.font.color.rgb = color
 ```
+
+## 版式守恒
+
+- 正文11pt/1.5倍行距，最小10.5pt；H1/H2/H3固定22/16/13pt
+- 段前后距统一，不用空段落撑排版；单段40-120字，超长拆标题/列表/表格
+- 小改优先`docx_edit`，不整份重生成
 
 ## 封面页
 
 ```python
 def add_cover(doc, title, subtitle="", author="", date_text=""):
-    for _ in range(6): doc.add_paragraph("")
-    p=doc.add_paragraph(); p.alignment=WD_ALIGN_PARAGRAPH.CENTER
+    p=doc.add_paragraph(); p.alignment=WD_ALIGN_PARAGRAPH.CENTER; p.paragraph_format.space_before=Pt(120)
     p.add_run("━"*30).font.color.rgb=RGBColor(0x1A,0x73,0xE8)
     pt=doc.add_paragraph(); pt.alignment=WD_ALIGN_PARAGRAPH.CENTER
     r=pt.add_run(title); r.font.size=Pt(28); r.font.bold=True
@@ -74,20 +86,19 @@ def add_cover(doc, title, subtitle="", author="", date_text=""):
         ps.add_run(subtitle).font.color.rgb=RGBColor(0x66,0x66,0x66)
     p2=doc.add_paragraph(); p2.alignment=WD_ALIGN_PARAGRAPH.CENTER
     p2.add_run("━"*30).font.color.rgb=RGBColor(0x1A,0x73,0xE8)
-    for _ in range(4): doc.add_paragraph("")
     if author or date_text:
-        pi=doc.add_paragraph(); pi.alignment=WD_ALIGN_PARAGRAPH.CENTER
+        pi=doc.add_paragraph(); pi.alignment=WD_ALIGN_PARAGRAPH.CENTER; pi.paragraph_format.space_before=Pt(48)
         pi.add_run("  |  ".join(filter(None,[f"作者：{author}" if author else "",date_text]))).font.color.rgb=RGBColor(0x99,0x99,0x99)
     doc.add_page_break()
 ```
 
 ## 目录
 
-用 TOC 域代码：fldChar begin → instrText `TOC \o "1-3" \h \z \u` → fldChar separate → 提示文字 → fldChar end → 分页。打开Word后右键目录更新域即可。
+TOC域代码：fldChar begin → instrText `TOC \o "1-3" \h \z \u` → fldChar separate → 提示 → fldChar end → 分页。
 
 ## 页眉页脚
 
-页眉右对齐放文档标题(Pt9灰色)，页脚居中放"第 PAGE 页"域代码。
+页眉右对齐文档标题(Pt9灰色)，页脚居中"第 PAGE 页"域代码。
 
 ## 表格
 
@@ -95,6 +106,7 @@ def add_cover(doc, title, subtitle="", author="", date_text=""):
 def add_table(doc, headers, rows):
     t=doc.add_table(rows=1+len(rows), cols=len(headers))
     t.alignment=WD_TABLE_ALIGNMENT.CENTER
+    t.autofit = False
     for i,h in enumerate(headers):
         c=t.rows[0].cells[i]; c.text=h
         r=c.paragraphs[0].runs[0]; r.font.bold=True; r.font.color.rgb=RGBColor(0xFF,0xFF,0xFF)
@@ -106,13 +118,31 @@ def add_table(doc, headers, rows):
                 etree.SubElement(c._tc.get_or_add_tcPr(), qn('w:shd')).set(qn('w:fill'), 'F4F7FB')
 ```
 
+表格必须固定列宽，不依赖Word自动缩放。
+
 ## 图片（不变形）
 
-用PIL预裁剪到目标比例后保存临时文件，再 `add_picture(tmp, width=Inches(6))`，段落居中。
+```python
+def add_doc_image(doc, img_path, width=Inches(6), ratio=16/9):
+    from whaleclaw.utils.image_crop import detect_face_info, smart_crop_box
+    with PILImage.open(img_path) as im:
+        iw, ih = im.size
+        tw, th = iw, int(iw/ratio)
+        if th > ih: tw, th = int(ih*ratio), ih
+        fi = detect_face_info(img_path)
+        x0,y0,x1,y1 = smart_crop_box(iw, ih, tw, th, face_info=fi)
+        cropped = im.crop((x0,y0,x1,y1))
+        tmp = img_path.rsplit('.',1)[0]+'_crop.jpg'
+        cropped.save(tmp, quality=92)
+    p = doc.add_picture(tmp, width=width)
+    doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+```
+
+人像自动人脸感知裁剪，非人像居中裁剪。只指定width，python-docx自动保持比例。
 
 ## 引用块
 
-段落左缩进1.5cm，通过 pBdr/w:left 添加蓝色(1A73E8)左侧色条(sz=24)。
+左缩进1.5cm，pBdr/w:left蓝色(1A73E8)色条(sz=24)。
 
 ---
 
@@ -143,8 +173,8 @@ def add_exp(doc, org, role, period, details):
     # 要点: List Bullet, 每条Pt10, 左缩进0.5cm
 ```
 
-**简历顺序**：姓名(居中Pt26)+联系方式 → 求职意向 → 工作经历(倒序) → 项目 → 教育 → 技能 → 证书
-**要求**：经历用"动词+量化结果"；技能具体到工具名；1-2页
+**简历顺序**：姓名(Pt26)+联系方式→求职意向→经历(倒序)→项目→教育→技能→证书
+**要求**：经历"动词+量化结果"；技能具体到工具名；1-2页
 
 ---
 
@@ -152,4 +182,5 @@ def add_exp(doc, org, role, period, details):
 
 封面→目录→页眉页脚→正文(H1/H2/H3)→表格→图片(居中带图注)→总结
 
-段落首行缩进或段间距；表格数据真实具体；引用用引用块；文末有总结
+- 图片统一宽度(5.8in或6.2in)，图注10pt灰色居中
+- 列表用Word原生样式；中文统一微软雅黑不混字体

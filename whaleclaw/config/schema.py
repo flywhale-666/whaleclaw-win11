@@ -8,13 +8,20 @@ from whaleclaw.config.paths import WORKSPACE_DIR
 from whaleclaw.mcp.config import McpConfig
 
 
+def _generate_jwt_secret() -> str:
+    """Generate a cryptographically random JWT secret."""
+    import secrets
+
+    return secrets.token_urlsafe(32)
+
+
 class AuthConfig(BaseModel):
     """Authentication configuration for the Gateway."""
 
     mode: str = "none"
     password: str | None = None
     token: str | None = None
-    jwt_secret: str = "whaleclaw-default-secret"
+    jwt_secret: str = Field(default_factory=_generate_jwt_secret)
     jwt_expire_hours: int = 24
 
 

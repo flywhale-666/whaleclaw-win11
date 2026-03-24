@@ -53,8 +53,8 @@ class CronStore:
             job.id,
             job.name,
             job.schedule,
-            json.dumps(job.schedule_obj.model_dump()) if job.schedule_obj else None,
-            json.dumps(job.action.model_dump()),
+            json.dumps(job.schedule_obj.model_dump(mode="json")) if job.schedule_obj else None,
+            json.dumps(job.action.model_dump(mode="json")),
             1 if job.enabled else 0,
             1 if job.one_shot else 0,
             job.created_at.isoformat(),
@@ -110,7 +110,11 @@ class CronStore:
     async def load_jobs(self) -> list[CronJob]:
         if not self._conn:
             return []
-        cursor = await self._conn.execute("SELECT * FROM cron_jobs")
+        cursor = await self._conn.execute(
+            "SELECT id, name, schedule, schedule_obj_json, action_json,"
+            " enabled, one_shot, created_at, last_run, next_run"
+            " FROM cron_jobs"
+        )
         rows = await cursor.fetchall()
         return [self._row_to_job(r) for r in rows]
 

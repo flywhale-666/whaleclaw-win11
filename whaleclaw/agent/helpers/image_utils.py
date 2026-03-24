@@ -471,6 +471,7 @@ def _build_nano_banana_command(
     prompt: str,
     input_paths: list[str],
     ratio: str,
+    base_url: str = "",
 ) -> str:
     """Build the fixed nano-banana script command."""
     script_path = (
@@ -506,6 +507,8 @@ def _build_nano_banana_command(
         "--aspect-ratio",
         shlex.quote(ratio or "auto"),
     ]
+    if base_url.strip():
+        parts.extend(["--base-url", shlex.quote(base_url.strip())])
     if model_display == "香蕉pro":
         parts.extend(["--image-size", "2K"])
     for path in input_paths:

@@ -8,7 +8,6 @@ import os
 import re
 import subprocess
 import tempfile
-import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -202,12 +201,13 @@ def _resolve_command_timeout(command: str, requested_timeout: int) -> int:
 
     Checks active skill hooks first; falls back to built-in nano-banana pattern.
     """
-    from whaleclaw.agent.helpers.tool_execution import _active_skill_hooks
+    from whaleclaw.agent.helpers.tool_execution import get_active_skill_hooks
 
-    if _active_skill_hooks is not None:
-        pattern = getattr(_active_skill_hooks, "long_running_script_pattern", None)
+    hooks = get_active_skill_hooks()
+    if hooks is not None:
+        pattern = getattr(hooks, "long_running_script_pattern", None)
         if pattern is not None and pattern.search(command):
-            floor = getattr(_active_skill_hooks, "long_running_timeout_seconds", 300)
+            floor = getattr(hooks, "long_running_timeout_seconds", 300)
             return max(requested_timeout, floor)
     if _NANO_BANANA_SCRIPT_RE.search(command):
         return max(requested_timeout, 300)
@@ -604,7 +604,18 @@ class BashTool(Tool):
                 "Execute a command on Windows (PowerShell 5.1). Returns stdout, stderr, and exit code. "
                 "IMPORTANT: The host OS is Windows. Use PowerShell or cmd-compatible syntax. "
                 "Avoid bash-only syntax (||, /dev/null, which, etc.). "
-                "To open a program use: Start-Process -FilePath \"path\\to\\app.exe\""
+                "To open a program use: Start-Process -FilePath \"path\\to\\app.exe\". "
+                "FINDING PROGRAMS: Do NOT guess exe paths or scan the disk. "
+                "Query the registry: "
+                "Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*',"
+                "'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' "
+                "| Where-Object DisplayName -like '*keyword*' "
+                "| Select-Object DisplayName,InstallLocation. "
+                "If found, list that InstallLocation to locate the exe. "
+                "If not in registry, report it is not installed. "
+                "FINDING FILES (documents, images, etc.): "
+                "Use Get-ChildItem -Recurse to search the disk. "
+                "This is ONLY for user files, never for programs."
             )
             cmd_desc = "The command to execute (PowerShell syntax preferred)."
         else:
@@ -654,6 +665,12 @@ class BashTool(Tool):
         for pattern in _DANGEROUS_PATTERNS:
             if pattern.search(command):
                 return ToolResult(success=False, output="", error=f"危险命令被拦截: {command}")
+
+        from whaleclaw.security.permissions import PermissionChecker, SecurityPolicy
+
+        _policy = SecurityPolicy()
+        if not PermissionChecker.check_command(command, _policy):
+            return ToolResult(success=False, output="", error=f"安全策略拦截: {command}")
 
         env = os.environ.copy()
         if _PROJECT_PYTHON_BIN is not None and _PROJECT_PYTHON_BIN.is_dir():

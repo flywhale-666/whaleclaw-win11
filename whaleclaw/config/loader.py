@@ -92,9 +92,47 @@ def load_config(
     except Exception as exc:
         raise ConfigError(f"配置校验失败: {exc}") from exc
 
+    _ensure_jwt_secret_persisted(cfg, user_cfg)
+
     global _config  # noqa: PLW0603
     _config = cfg
     return cfg
+
+
+def _ensure_jwt_secret_persisted(
+    cfg: WhaleclawConfig,
+    config_path: Path,
+) -> None:
+    """Persist a randomly generated JWT secret so it survives restarts."""
+    raw: dict[str, object] = {}
+    if config_path.is_file():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                raw = data  # type: ignore[assignment]
+        except Exception:
+            pass
+
+    gw = raw.get("gateway")
+    if not isinstance(gw, dict):
+        gw = {}
+    auth = gw.get("auth")
+    if not isinstance(auth, dict):
+        auth = {}
+
+    if auth.get("jwt_secret"):
+        return
+
+    auth["jwt_secret"] = cfg.gateway.auth.jwt_secret
+    gw["auth"] = auth
+    raw["gateway"] = gw
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps(raw, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 def get_config() -> WhaleclawConfig:

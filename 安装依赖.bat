@@ -42,8 +42,8 @@ if errorlevel 1 (
   exit /b 1
 )
 
-echo [INFO] Installing WhaleClaw dependencies ^(dev + office + vision^)...
-"%PYTHON%" -m pip install -e ".[dev,office,vision]"
+echo [INFO] Installing WhaleClaw dependencies ^(dev + office + vision + vector^)...
+"%PYTHON%" -m pip install -e ".[dev,office,vision,vector]"
 if errorlevel 1 (
   echo [ERROR] Dependency installation failed.
   pause

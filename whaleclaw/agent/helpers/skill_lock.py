@@ -26,6 +26,12 @@ CORE_NATIVE_TOOLS = {
 _NANO_BANANA_DEFAULT_MODEL_FILE = (
     Path.home() / ".whaleclaw" / "credentials" / "nano_banana_default_model.txt"
 )
+_NANO_BANANA_BASE_URL_FILE = (
+    Path.home() / ".whaleclaw" / "credentials" / "nano_banana_base_url.txt"
+)
+_NANO_BANANA_DEFAULT_BASE_URL = "https://ai.t8star.cn"
+_NANO_BANANA_BACKUP_BASE_URL = "https://ai.comfly.chat"
+_NANO_BANANA_ALLOWED_BASE_URLS = {_NANO_BANANA_DEFAULT_BASE_URL, _NANO_BANANA_BACKUP_BASE_URL}
 MAX_NATIVE_TOOLS = 16
 TOOL_POLICY_KEYWORDS: dict[tuple[str, ...], tuple[str, ...]] = {
     ("ppt", "pptx", "幻灯片", "演示文稿"): ("ppt_edit", "file_edit", "patch_apply"),
@@ -432,7 +438,7 @@ def detect_nano_banana_model_display(text: str, previous: str = "香蕉2") -> st
         return "香蕉pro"
     if any(
         token in normalized
-        for token in ("香蕉2", "banana生图", "香蕉生图", "gemini-3.1-flash-image-preview")
+        for token in ("香蕉2", "banana生图", "香蕉生图", "香蕉生图片", "gemini-3.1-flash-image-preview")
     ):
         return "香蕉2"
     return previous
@@ -441,16 +447,28 @@ def detect_nano_banana_model_display(text: str, previous: str = "香蕉2") -> st
 _NANO_BANANA_CONTROL_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^(?:请)?(?:我想|我要|我想要)?(?:用|使用)?\s*"
-        r"(?:香蕉生图|香蕉文生图|香蕉图生图|banana生图|banana文生图|banana图生图|"
+        r"(?:香蕉生图片?|香蕉文生图片?|香蕉图生图片?|banana生图片?|banana文生图片?|banana图生图片?|"
         r"nanobanana|nano\s*banana|nano-banana-2)\s*$",
         re.IGNORECASE,
     ),
     re.compile(
-        r"^(?:切换|切换到|改用|换成|默认模型)\s*(?:香蕉2|香蕉pro)\s*$",
+        r"^(?:切换|切换到|换|换成|改用|默认模型|切换模型|换模型)\s*(?:香蕉2|香蕉pro)\s*$",
         re.IGNORECASE,
     ),
     re.compile(
-        r"^(?:用|改用|切换到)?\s*(?:香蕉2|香蕉pro)\s*(?:重试|再试一次|继续|继续跑)?\s*$",
+        r"^(?:用|改用|切换到|切换|换)?\s*(?:香蕉2|香蕉pro)\s*(?:重试|再试一次|继续|继续跑)?\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:切换|换成|换|改用|使用|恢复)?\s*(?:默认|备用)\s*(?:基?地址|api基?地址|base\s*url)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:默认|备用)\s*(?:基?地址|api基?地址|base\s*url)\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^(?:切换|切回|换回|恢复)\s*(?:基地址|原始地址|原地址)\s*$",
         re.IGNORECASE,
     ),
 )
@@ -458,7 +476,7 @@ _NANO_BANANA_CONTROL_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
 _NANO_BANANA_ACTIVATION_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"^(?:请)?(?:我想|我要|我想要)?(?:用|使用)?\s*"
-        r"(?:香蕉生图|香蕉文生图|香蕉图生图|banana生图|banana文生图|banana图生图|"
+        r"(?:香蕉生图片?|香蕉文生图片?|香蕉图生图片?|banana生图片?|banana文生图片?|banana图生图片?|"
         r"nanobanana|nano\s*banana|nano-banana-2)\s*$",
         re.IGNORECASE,
     ),
@@ -466,7 +484,9 @@ _NANO_BANANA_ACTIVATION_MESSAGE_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _NANO_BANANA_ACTIVATION_TOKENS: tuple[str, ...] = (
     "香蕉生图",
+    "香蕉生图片",
     "香蕉文生图",
+    "香蕉文生图片",
     "香蕉图生图",
     "banana生图",
     "banana文生图",
@@ -526,6 +546,58 @@ def load_saved_nano_banana_model_display() -> str:
     if raw == "nano-banana-2":
         return "香蕉pro"
     return "香蕉2"
+
+
+def load_saved_nano_banana_base_url() -> str:
+    """Load persisted Nano Banana API base URL."""
+    try:
+        raw = _NANO_BANANA_BASE_URL_FILE.read_text(encoding="utf-8").strip().rstrip("/")
+    except OSError:
+        return _NANO_BANANA_DEFAULT_BASE_URL
+    if raw in _NANO_BANANA_ALLOWED_BASE_URLS:
+        return raw
+    return _NANO_BANANA_DEFAULT_BASE_URL
+
+
+def save_nano_banana_base_url(url: str) -> None:
+    """Persist Nano Banana API base URL to file."""
+    cleaned = url.strip().rstrip("/")
+    if cleaned not in _NANO_BANANA_ALLOWED_BASE_URLS:
+        return
+    _NANO_BANANA_BASE_URL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _NANO_BANANA_BASE_URL_FILE.write_text(cleaned, encoding="utf-8")
+    try:
+        os.chmod(_NANO_BANANA_BASE_URL_FILE, 0o600)
+    except OSError:
+        pass
+
+
+_NANO_BANANA_BASE_URL_SWITCH_DEFAULT_RE = re.compile(
+    r"(?:切换|换成|换|改用|使用|恢复)?\s*默认\s*(?:基?地址|api基?地址|base\s*url)",
+    re.IGNORECASE,
+)
+_NANO_BANANA_BASE_URL_SWITCH_BACKUP_RE = re.compile(
+    r"(?:切换|换成|换|改用|使用)?\s*备用\s*(?:基?地址|api基?地址|base\s*url)",
+    re.IGNORECASE,
+)
+_NANO_BANANA_BASE_URL_SWITCH_BACK_TO_DEFAULT_RE = re.compile(
+    r"^(?:切换|切回|换回|恢复)\s*(?:基地址|原始地址|原地址)\s*$",
+    re.IGNORECASE,
+)
+
+
+def detect_nano_banana_base_url_switch(text: str) -> str | None:
+    """Detect if user wants to switch base URL. Returns target URL or None."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if _NANO_BANANA_BASE_URL_SWITCH_BACKUP_RE.search(stripped):
+        return _NANO_BANANA_BACKUP_BASE_URL
+    if _NANO_BANANA_BASE_URL_SWITCH_DEFAULT_RE.search(stripped):
+        return _NANO_BANANA_DEFAULT_BASE_URL
+    if _NANO_BANANA_BASE_URL_SWITCH_BACK_TO_DEFAULT_RE.search(stripped):
+        return _NANO_BANANA_DEFAULT_BASE_URL
+    return None
 
 
 def sanitize_nano_banana_prompt_value(value: object) -> str:

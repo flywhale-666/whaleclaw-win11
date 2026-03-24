@@ -422,6 +422,11 @@ def apply_tool_result_guards(
     if result.success and is_progress_stage_tool_call(tc):
         state.search_query_repeat_streak = 0
         state.last_search_query = ""
+        if tc.name != "bash":
+            state.same_failed_bash_streak = 0
+            state.last_failed_bash_signature = ""
+            state.bash_fail_streak = 0
+            state.browser_fail_streak = 0
     return update
 
 

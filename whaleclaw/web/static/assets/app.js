@@ -748,6 +748,7 @@ createApp({
       const base = {
         name: cronFormName.value.trim(),
         message: cronFormMessage.value.trim(),
+        session_id: activeSessionId.value || '',
       };
       if (kind === 'daily') {
         const h = Number(cronFormHour.value);
@@ -1871,17 +1872,19 @@ createApp({
         } else if (msg.type === 'message') {
           const msgSid = msg.session_id || '';
           const isOwnSession = msgSid && msgSid === activeSessionId.value;
+          const contentText = msg.payload.content || '';
+          const isCronReminder = contentText.startsWith('⏰');
           isStreaming.value = false;
           if (streamingMessage) {
-            streamingMessage.content = msg.payload.content || streamingMessage.content;
+            streamingMessage.content = contentText || streamingMessage.content;
             streamingMessage.rendered = renderMarkdown(streamingMessage.content);
             streamingMessage = null;
-          } else if (isOwnSession) {
+          } else if (isOwnSession || isCronReminder) {
             messages.value.push({
               id: `msg-${Date.now()}`,
               role: 'assistant',
-              content: msg.payload.content,
-              rendered: renderMarkdown(msg.payload.content),
+              content: contentText,
+              rendered: renderMarkdown(contentText),
               toolCalls: [],
             });
           }

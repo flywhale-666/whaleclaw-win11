@@ -89,16 +89,21 @@ class CronJob(BaseModel):
 
 
 def _matches_cron_expr(expr: str, now: datetime) -> bool:
-    """Check if a 5-field cron expression matches the given time."""
+    """Check if a 5-field cron expression matches the given time.
+
+    The weekday field follows standard cron convention: 0=Sunday, 1=Monday, ..., 6=Saturday.
+    Python's ``datetime.weekday()`` returns 0=Monday, so we convert via ``isoweekday() % 7``.
+    """
     parts = expr.split()
     if len(parts) != 5:
         return False
+    cron_dow = now.isoweekday() % 7  # Mon=1..Sun=7 -> Mon=1..Sat=6,Sun=0
     return (
         _parse_cron_field(parts[0], 0, 59, now.minute)
         and _parse_cron_field(parts[1], 0, 23, now.hour)
         and _parse_cron_field(parts[2], 1, 31, now.day)
         and _parse_cron_field(parts[3], 1, 12, now.month)
-        and _parse_cron_field(parts[4], 0, 6, now.weekday())
+        and _parse_cron_field(parts[4], 0, 6, cron_dow)
     )
 
 
@@ -159,6 +164,12 @@ class CronScheduler:
         job = job.model_copy(update={"last_run": datetime.now()})
         self._jobs[job_id] = job
 
+        if self._on_save is not None:
+            try:
+                await self._on_save(job)
+            except Exception:
+                logger.warning("cron_persist_save_after_run_failed", job_id=job_id)
+
         if self._on_fire:
             try:
                 await self._on_fire(job_id, job.action)
@@ -175,10 +186,14 @@ class CronScheduler:
 
         sched = job.schedule_obj
         if sched is None:
-            return _matches_cron_expr(job.schedule, now)
+            if not _matches_cron_expr(job.schedule, now):
+                return False
+            return not self._already_fired_this_minute(job, now)
 
         if sched.kind == "cron":
-            return _matches_cron_expr(sched.expr or job.schedule, now)
+            if not _matches_cron_expr(sched.expr or job.schedule, now):
+                return False
+            return not self._already_fired_this_minute(job, now)
 
         if sched.kind == "at":
             if sched.at is None:
@@ -188,12 +203,24 @@ class CronScheduler:
         if sched.kind == "every":
             if sched.every_seconds <= 0:
                 return False
-            if job.last_run is None:
-                return True
-            elapsed = (now - job.last_run).total_seconds()
+            baseline = job.last_run or job.created_at
+            elapsed = (now - baseline).total_seconds()
             return elapsed >= sched.every_seconds
 
         return False
+
+    @staticmethod
+    def _already_fired_this_minute(job: CronJob, now: datetime) -> bool:
+        """Return True if *job* already fired within the same calendar minute."""
+        if job.last_run is None:
+            return False
+        return (
+            job.last_run.year == now.year
+            and job.last_run.month == now.month
+            and job.last_run.day == now.day
+            and job.last_run.hour == now.hour
+            and job.last_run.minute == now.minute
+        )
 
     async def _run_loop(self) -> None:
         while self._running:
@@ -203,7 +230,13 @@ class CronScheduler:
             now = datetime.now()
             for job in list(self._jobs.values()):
                 if self._should_run(job, now):
-                    await self.trigger_job(job.id)
+                    asyncio.create_task(self._safe_trigger(job.id))
+
+    async def _safe_trigger(self, job_id: str) -> None:
+        try:
+            await self.trigger_job(job_id)
+        except Exception as exc:
+            logger.error("cron_trigger_unhandled", job_id=job_id, error=str(exc))
 
     async def start(self) -> None:
         self._running = True

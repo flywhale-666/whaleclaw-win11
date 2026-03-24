@@ -4,7 +4,7 @@ triggers:
   - pptx
   - 幻灯片
   - 演示文稿
-max_tokens: 2200
+max_tokens: 2300
 lock_session: false
 ---
 
@@ -12,17 +12,15 @@ lock_session: false
 
 ## 流程
 
-1. 先回复用户：说明几页、什么内容
-2. `browser` → 搜图（关键词具体：风景搜"[地名] 风景 高清"，人物搜"[人名] 写真"，商务搜"business professional"），封面图选横版
-3. `file_write` → 完整脚本到 `~/.whaleclaw/workspace/tmp/gen_ppt_xxx.py`
-4. `bash` → 执行（Win: `.\python\python.exe`）
-5. 告诉用户路径
+1. 回复用户：几页、什么内容
+2. `browser`搜图（根据主题搜"[关键词] 高清"），封面优先横版高清大图
+3. `file_write`完整脚本→`~/.whaleclaw/workspace/tmp/gen_ppt_xxx.py`
+4. `bash`执行 → 告诉用户路径
 
-复刻模式：用户提供截图→vision提取配色布局→确认→搜图→写脚本；提供.pptx→bash提取颜色字体→自定义变量→写脚本。
+复刻：截图→vision提取配色→确认→搜图→脚本；.pptx→bash提取→脚本
+严禁：`python -c`；分多次file_write；硬编码路径；重写辅助函数
 
-严禁：不用 `python -c`；不分多次 file_write；图片路径硬编码绝对路径
-
-## 基础
+## 基础（脚本开头必须包含）
 
 ```python
 from pptx import Presentation
@@ -31,134 +29,124 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.enum.shapes import MSO_SHAPE
 from PIL import Image as PILImage
-
 prs = Presentation()
-prs.slide_width = Inches(13.333); prs.slide_height = Inches(7.5)
+prs.slide_width = Inches(13.333); prs.slide_height = Inches(7.5)  # 必须设置！
 SW, SH = prs.slide_width, prs.slide_height
 ```
 
-## 配色（7变量全文统一）
+配色7变量：PRIMARY/SECONDARY/ACCENT/BG_LIGHT/TEXT_DARK/TEXT_LIGHT/TEXT_GRAY
+字体：中文"Microsoft YaHei"，英文"Arial Black"/"Arial"
+字号：HERO=44 H1=32 H2=24 BODY=16 CAPTION=12 NUMBER=56
 
-定义 PRIMARY/SECONDARY/ACCENT/BG_LIGHT/TEXT_DARK/TEXT_LIGHT/TEXT_GRAY，按主题自动选色。
-字体：标题 "Microsoft YaHei"，英文 "Arial Black"/"Arial"
-字号(Pt)：HERO=44, H1=32, H2=24, BODY=16, CAPTION=12, NUMBER=56
-
-## 辅助函数
+## 辅助函数（原样复制到脚本，禁止重写）
 
 ```python
 def add_picture_cropped(slide, img_path, left, top, tw, th):
+    from whaleclaw.utils.image_crop import detect_face_info, smart_crop_box
     with PILImage.open(img_path) as im: iw, ih = im.size
-    r1, r2 = iw/ih, tw/th
-    if r1 > r2: sh = th; sw = th*r1
-    else: sw = tw; sh = tw/r1
-    pic = slide.shapes.add_picture(img_path, int(left-(sw-tw)/2), int(top-(sh-th)/2), int(sw), int(sh))
-    clr, ctb = (sw-tw)/2/sw, (sh-th)/2/sh
-    pic.crop_left=clr; pic.crop_right=clr; pic.crop_top=ctb; pic.crop_bottom=ctb
-    pic.left=int(left); pic.top=int(top); pic.width=int(tw); pic.height=int(th)
+    img_r, box_r = iw/ih, tw/th
+    if img_r > box_r: sw,sh = int(th*img_r), int(th)
+    else: sw,sh = int(tw), int(tw/img_r)
+    pic = slide.shapes.add_picture(img_path, int(left), int(top), sw, sh)
+    fi = detect_face_info(img_path)
+    x0,y0,x1,y1 = smart_crop_box(iw, ih, tw, th, face_info=fi)
+    # 注意: left/right 除以 iw(宽), top/bottom 除以 ih(高), 不要混淆!
+    pic.crop_left=x0/iw; pic.crop_right=1-x1/iw
+    pic.crop_top=y0/ih; pic.crop_bottom=1-y1/ih  # ← 必须是 ih 不是 iw
 
-def add_rect(slide, l, t, w, h, color, alpha=1.0):
-    s = slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE, int(l), int(t), int(w), int(h))
+def add_rect(slide, l, t, w, h, color, alpha=1.0, shape=MSO_SHAPE.RECTANGLE):
+    s = slide.shapes.add_shape(shape, int(l), int(t), int(w), int(h))
     s.fill.solid(); s.fill.fore_color.rgb = color; s.line.fill.background()
     if alpha < 1.0:
         from pptx.oxml.ns import qn; from lxml import etree
-        sf = s.fill._fill.find(qn("a:solidFill"))
-        if sf is not None and len(sf):
-            etree.SubElement(sf[0], qn("a:alpha")).set("val", str(int(alpha*100000)))
+        sf = s._element.spPr.find(qn("a:solidFill"))
+        if sf is not None:
+            clr = sf.find(qn("a:srgbClr"))
+            if clr is not None:
+                etree.SubElement(clr, qn("a:alpha")).set("val", str(int(alpha*100000)))
     return s
 
-def add_tb(slide, l, t, w, h, text, sz, color, bold=False, fn="Microsoft YaHei", align=PP_ALIGN.LEFT):
+def add_tb(slide, l, t, w, h, text, sz, color, bold=False, align=PP_ALIGN.LEFT):
+    from pptx.enum.text import MSO_AUTO_SIZE
     tb = slide.shapes.add_textbox(int(l), int(t), int(w), int(h))
-    tb.text_frame.word_wrap = True
-    p = tb.text_frame.paragraphs[0]; p.text = text; p.alignment = align
-    r = p.runs[0]; r.font.size = sz; r.font.color.rgb = color; r.font.bold = bold; r.font.name = fn
+    tf = tb.text_frame; tf.word_wrap = True
+    tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    tf.margin_left=tf.margin_right=Pt(2); tf.margin_top=tf.margin_bottom=0
+    p = tf.paragraphs[0]; p.text = text; p.alignment = align
+    r = p.runs[0]; r.font.size=sz; r.font.color.rgb=color; r.font.bold=bold; r.font.name="Microsoft YaHei"
+    p.space_before=p.space_after=0; p.line_spacing=1.15
     return tb
 ```
 
-## 模板
+add_tb的h：单行≥字号×1.5，多行≥行数×字号×1.3。放不下则减条或拆页。
 
-### 1A 全图封面
-全屏图+底部半透明条(≤45%,alpha0.75)+标题。禁止全屏纯色矩形。
+可用形状：RECTANGLE/ROUNDED_RECTANGLE/OVAL/ISOSCELES_TRIANGLE/RIGHT_TRIANGLE/PARALLELOGRAM/TRAPEZOID/DIAMOND/CHEVRON，禁止使用不在此列表中的MSO_SHAPE常量。
 
-```python
-def make_cover(prs, title, subtitle, img):
-    s = prs.slides.add_slide(prs.slide_layouts[6])
-    add_picture_cropped(s, img, 0, 0, SW, SH)
-    add_rect(s, 0, int(SH*0.55), SW, SH-int(SH*0.55), PRIMARY, 0.75)
-    add_tb(s, Inches(1), int(SH*0.60), Inches(11), Inches(1.2), title, SIZE_HERO, TEXT_LIGHT, True)
-    add_tb(s, Inches(1), int(SH*0.78), Inches(9), Inches(0.6), subtitle, SIZE_BODY, RGBColor(0xCC,0xCC,0xCC))
-```
+## 风格指引
 
-### 1B 左右分栏封面（商务/正式）
-左42%纯色+标题装饰线，右58%图片。图片最后添加。
+| 主题 | 配色 | 封面 | 装饰 |
+|-----|-----|-----|-----|
+| 人物 | 紫/玫红+金 | 左右分栏 | 金竖线、圆角标签 |
+| 旅行 | 蓝/青绿+橙 | 全图+底栏 | 波浪线、色块 |
+| 商务 | 深蓝+金 | 上下分区/分栏 | 横线、标签 |
+| 科技 | 暗灰+荧光 | 斜切/几何 | 线条框、色块 |
+| 教育 | 绿/暖橙+白 | 居中卡片 | 圆形编号、色带 |
+| 美食 | 暖红/橙+白 | 全图+底栏 | 圆角色块 |
+| 其他 | 自选有辨识度 | 自由 | ≥2种装饰 |
 
-### 2 左图右文
-左45%图，右55%标题+装饰线+自适应要点。**图片最后添加（Z-order铁律）。**
+同主题多次生成应变换布局。
 
-```python
-def make_left_img(prs, title, bullets, img, pn=""):
-    s = prs.slides.add_slide(prs.slide_layouts[6])
-    s.background.fill.solid(); s.background.fill.fore_color.rgb = BG_LIGHT
-    add_tb(s, Inches(6.8), Inches(0.8), Inches(5.8), Inches(1), title, SIZE_H1, PRIMARY, True)
-    ln = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(6.8), Inches(1.7), Inches(1.5), Pt(4))
-    ln.fill.solid(); ln.fill.fore_color.rgb = ACCENT; ln.line.fill.background()
-    ys, ye = Inches(2.1), Inches(6.8)
-    sp = min((ye-ys)/max(len(bullets),1), Inches(1.15))
-    for i, b in enumerate(bullets):
-        y = int(ys + sp*i)
-        d = s.shapes.add_shape(MSO_SHAPE.OVAL, Inches(6.8), int(y+Pt(4)), Pt(10), Pt(10))
-        d.fill.solid(); d.fill.fore_color.rgb = SECONDARY; d.line.fill.background()
-        add_tb(s, Inches(7.15), y, Inches(5.3), int(sp-Pt(4)), b, SIZE_BODY, TEXT_DARK)
-    add_picture_cropped(s, img, Inches(0.6), Inches(0.6), Inches(5.6), Inches(6.3))
-```
+## 排版通则
 
-### 3 右图左文
-模板2的镜像：左侧文字x=0.8，右侧图片x=7.1。其余结构相同。图片最后添加。
+- **安全区**：上下≥0.5in，左右≥0.6in，文字/元素不超出
+- **对齐**：同区域元素左对齐；标题、装饰线、要点左边缘一致
+- **间距**：标题→装饰线≈0.1in → 首条要点≈0.3in → 要点等距
+- **文字区宽度**：图文页占50-55%宽，不低于40%
+- **图片留白**：四周≥0.5in（全屏封面除外）
+- **装饰线**：横1.5-3in×4-6pt，竖4-6pt×按需；形状根据主题自选
+- **版式守恒**：1页1点，超量拆页不缩字号；标题≤18字，要点≤32字/条
+- **最小字号**：HERO≥36 H1≥28 H2≥22 BODY≥15 CAPTION≥11；小改用`ppt_edit`
 
-### 4 数据页（⚠️禁止图片）
-顶部色条+标题，横排白色卡片(最多4个，含大数字+标签)。data_items: [(number, label), ...]
+## 版式设计规则
 
-```python
-def make_data(prs, title, items, pn=""):
-    s = prs.slides.add_slide(prs.slide_layouts[6])
-    s.background.fill.solid(); s.background.fill.fore_color.rgb = BG_LIGHT
-    bar = s.shapes.add_shape(MSO_SHAPE.RECTANGLE, 0, 0, SW, Inches(1.4))
-    bar.fill.solid(); bar.fill.fore_color.rgb = PRIMARY; bar.line.fill.background()
-    add_tb(s, Inches(0.8), Inches(0.25), Inches(11), Inches(0.9), title, SIZE_H1, TEXT_LIGHT, True)
-    n = min(len(items), 4); cw, gap = Inches(2.8), Inches(0.5)
-    sx = int((SW - n*cw - (n-1)*gap)/2)
-    for i, (num, lbl) in enumerate(items[:4]):
-        cx = int(sx + i*(cw+gap))
-        add_rect(s, cx, Inches(2), cw, Inches(3.2), RGBColor(0xFF,0xFF,0xFF))
-        add_tb(s, cx+Inches(0.2), int(Inches(2.5)), int(cw-Inches(0.4)), Inches(1.2), num, SIZE_NUMBER, ACCENT, True, align=PP_ALIGN.CENTER)
-        add_tb(s, cx+Inches(0.2), int(Inches(3.7)), int(cw-Inches(0.4)), Inches(0.6), lbl, SIZE_BODY, TEXT_DARK, align=PP_ALIGN.CENTER)
-```
+### 封面
+- ≥6 shapes，标题+副标题+≥2 ACCENT装饰
+- 布局：左右分栏 / 全图+底栏 / 上下分区 / 斜切 / 居中卡片
+- 全图遮罩≤45%面积，alpha≤0.75
+- 标题居中偏上(y 30-40%)或底栏内(y 55-65%)
+- 标题与副标题间用装饰横线分隔；副标题旁可加竖条/色块
 
-### 5 结尾页
-全屏图+半透明遮罩 或 纯色背景，居中标题+副标题。可选contact_info字典显示联系方式。
+### 内容页
+- 图片占42-48%宽，文字区占剩余，BG_LIGHT背景
+- 图片距边≥0.5in，高占80-85%，用add_picture_cropped
+- 文字区：标题y≈0.8in → 装饰线y≈标题下0.1in → 要点y≈2.0in起
+- 要点3-5条等距，带色块标记(SECONDARY)，标记与文字距0.3in
+- 左图右文/右图左文交替；图片最后添加(Z-order)
 
-### 6 章节过渡页（10页以上必须有）
-纯色背景，左侧大编号(Pt120)，右侧章节标题+描述。
+### 数据页
+- 禁止图片，顶部PRIMARY标题栏(高≈1.3in)
+- 下方2-4白色卡片等距，宽≈2.5-3in
+- 卡片内NUMBER大字+BODY说明，均居中
 
-### 7 上图下文
-上55%大图，下方标题+多列要点(最多3列)。图片最后添加。
+### 结尾页
+- ≥5 shapes，独立结尾（3页也必须有）
+- 呼应封面配色，标题+副标题+≥1 ACCENT装饰
+- 标题垂直居中(y 40-55%)居中对齐
+- 禁全屏不透明遮罩；可用封面镜像/全图居中/纯色大字
 
-### 8 对比页
-两栏对比，顶部色块标题+下方要点，中间竖线分隔。适合优缺点/方案对比。
+### 过渡页（10页+必须有）
+- PRIMARY纯色背景，左侧大编号Pt120(ACCENT)x≈1in，右侧标题x≈5in
 
 ## 组合
 
-- **5页**：封面→左图右文→右图左文→左图右文→结尾
+- **3页**：封面→内容→结尾 / **5页**：封面→左→右→左→结尾
 - **7页**：封面→左→右→数据→左→右→结尾
-- **10页**：封面→左→过渡→右→上图下文→过渡→数据→左→对比→结尾
-- **12+页**：封面→[过渡→2~3内容页]×N章节→数据→结尾
-- 7页以上至少3种模板；10页以上必须有过渡页；内容页交替变化
+- **10+**：封面→[过渡→2~3内容]×N→数据→结尾
 
 ## 铁律
 
-- **Z-order**：图片最后添加，确保在最上层
-- **数据页禁止图片**
-- **所有图片用add_picture_cropped**，严禁add_picture同时指定宽高
-- **封面遮罩≤45%，必须半透明**
-- **要点≥3条，自适应间距，不溢出**
-- **内容具体**（带价格/时间/数字）
-- **配色全文统一**
+- **辅助函数原样复制到脚本，禁止重写/简化/替代**；禁用shape.fill.transparency
+- 图片最后添加(Z-order)；**只用add_picture_cropped**，之后禁设width/height
+- 封面≥6 shapes、结尾≥5 shapes，含ACCENT装饰；3页也要独立结尾
+- 遮罩≤45%面积+alpha≤0.75；禁全屏不透明遮罩；数据页禁图片
+- 内容具体带数字；配色统一；每次变换封面/结尾布局

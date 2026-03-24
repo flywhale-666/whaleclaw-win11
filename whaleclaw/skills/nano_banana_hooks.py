@@ -12,14 +12,17 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from whaleclaw.agent.helpers.skill_lock import (
+    detect_nano_banana_base_url_switch,
     detect_nano_banana_model_display,
     extract_ratio_or_size,
     format_param_status,
     is_nano_banana_activation_message,
     is_nano_banana_control_message,
+    load_saved_nano_banana_base_url,
     load_saved_nano_banana_model_display,
     param_satisfied,
     sanitize_nano_banana_prompt_value,
+    save_nano_banana_base_url,
 )
 from whaleclaw.providers.base import ImageContent, Message
 from whaleclaw.skills.hooks import DefaultSkillHooks
@@ -51,11 +54,16 @@ class Hooks(DefaultSkillHooks):
         else:
             model_line = "2) 当前模型：香蕉2（0.1元）可切换模型香蕉pro（0.2元）"
 
+        current_base_url = str(
+            state.get("__base_url__", load_saved_nano_banana_base_url())
+        ).strip() or load_saved_nano_banana_base_url()
+        base_url_line = f"3) API 地址：{current_base_url}"
+
         prompt_value = sanitize_nano_banana_prompt_value(state.get("prompt"))
         prompt_status = (
-            "3) 提示词：已收到"
+            "4) 提示词：已收到"
             if param_satisfied(SPI(key="prompt", type="text"), prompt_value)
-            else "3) 提示词：未提供"
+            else "4) 提示词：未提供"
         )
         image_status = format_param_status(
             SPI(key="images", label="图生图图片", type="images", required=False, min_count=1),
@@ -78,9 +86,10 @@ class Hooks(DefaultSkillHooks):
                 else "1) API Key：未提供"
             ),
             model_line,
+            base_url_line,
             prompt_status,
-            f"4) {image_status}",
-            "5) 切换本次模型：切换香蕉2（pro）。设置默认模型：默认模型香蕉2（pro）",
+            f"5) {image_status}",
+            "6) 切换本次模型：切换香蕉2（pro）。设置默认模型：默认模型香蕉2（pro）",
         ]
         missing_prompts: list[str] = []
         if not has_key:
@@ -164,6 +173,14 @@ class Hooks(DefaultSkillHooks):
             message, previous=previous_model
         )
 
+        previous_base_url = str(
+            state.get("__base_url__", load_saved_nano_banana_base_url())
+        )
+        switched_url = detect_nano_banana_base_url_switch(message)
+        if switched_url:
+            save_nano_banana_base_url(switched_url)
+        new_state["__base_url__"] = switched_url or previous_base_url
+
         ratio = extract_ratio_or_size(message)
         if ratio:
             new_state["ratio"] = ratio
@@ -202,6 +219,9 @@ class Hooks(DefaultSkillHooks):
         ).strip() or "香蕉2"
         prompt = str(state.get("prompt", "")).strip()
         ratio = str(state.get("ratio", "auto")).strip() or "auto"
+        effective_base_url = str(
+            state.get("__base_url__", load_saved_nano_banana_base_url())
+        ).strip()
         input_paths: list[str] = []
         if mode == "edit":
             input_paths = _resolve_nano_banana_input_paths("", session)
@@ -211,6 +231,7 @@ class Hooks(DefaultSkillHooks):
             prompt=prompt,
             input_paths=input_paths,
             ratio=ratio,
+            base_url=effective_base_url,
         )
 
     def build_execution_system_message(
@@ -264,6 +285,21 @@ class Hooks(DefaultSkillHooks):
             "如果要继续生图，请直接发送提示词或图片；"
             '如果本轮已结束，请回复"任务完成"解除技能锁定。'
         )
+
+    def handle_control_message(
+        self,
+        message: str,
+        state: dict[str, object],
+        session: Session | None,
+    ) -> str | None:
+        switched_base_url = detect_nano_banana_base_url_switch(message)
+        if switched_base_url:
+            save_nano_banana_base_url(switched_base_url)
+            return f"切换成功，当前 API 地址：{switched_base_url}"
+        model_display = str(
+            state.get("__model_display__", load_saved_nano_banana_model_display())
+        ).strip() or load_saved_nano_banana_model_display()
+        return f"切换成功，当前模型：{model_display}"
 
     # ── image buffer ─────────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ import asyncio
 import json
 import re
 import shutil
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -63,6 +64,24 @@ from whaleclaw.version import __version__
 log = get_logger(__name__)
 
 _UPLOAD_DIR = WHALECLAW_HOME / "uploads"
+
+
+_SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+
+def _is_safe_id(value: str) -> bool:
+    """Validate an identifier contains only safe characters (alphanumeric, -, _)."""
+    return bool(value) and bool(_SAFE_ID_RE.match(value))
+
+
+def _secure_filename(filename: str) -> str:
+    """Sanitize an uploaded filename: strip path separators and traversal."""
+    name = filename.replace("\\", "/")
+    name = name.rsplit("/", 1)[-1]
+    name = name.lstrip(".")
+    # Remove any remaining path traversal or null bytes
+    name = name.replace("\x00", "").replace("..", "").strip()
+    return name
 _CRON_DB_PATH = WHALECLAW_HOME / "cron.db"
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "web" / "static"
 _MULTI_AGENT_MODES = {"parallel", "serial"}
@@ -493,6 +512,15 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         await plugin_registry.start_all()
         await cron_scheduler.start()
 
+        nonlocal feishu_channel
+        feishu_cfg = config.channels.feishu
+        if feishu_cfg.app_id and feishu_cfg.app_secret:
+            from whaleclaw.channels.feishu import FeishuChannel
+            from whaleclaw.channels.feishu.config import FeishuConfig
+
+            feishu_channel = FeishuChannel(FeishuConfig(**feishu_cfg.model_dump()))
+            await feishu_channel.start()
+
         summarizer_model = config.agent.summarizer.model.strip()
         prewarm_task: asyncio.Task[None] | None = None
         if config.agent.summarizer.enabled and summarizer_model:
@@ -574,24 +602,16 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             state["compression_ready"] = True
             state["compression_running"] = False
 
-        nonlocal feishu_channel
-        feishu_cfg = config.channels.feishu
-        if feishu_cfg.app_id and feishu_cfg.app_secret:
-            from whaleclaw.channels.feishu import FeishuChannel
-            from whaleclaw.channels.feishu.config import FeishuConfig
-
-            feishu_channel = FeishuChannel(FeishuConfig(**feishu_cfg.model_dump()))
-            await feishu_channel.start()
-            if feishu_channel.bot is not None:
-                feishu_channel.bot.bind_agent(
-                    config,
-                    manager,
-                    registry,
-                    memory_manager=memory_manager,
-                    hook_manager=hook_manager,
-                    group_compressor=state["group_compressor"],
-                    compression_ready_fn=lambda: bool(state["compression_ready"]),
-                )
+        if feishu_channel is not None and feishu_channel.bot is not None:
+            feishu_channel.bot.bind_agent(
+                config,
+                manager,
+                registry,
+                memory_manager=memory_manager,
+                hook_manager=hook_manager,
+                group_compressor=state["group_compressor"],
+                compression_ready_fn=lambda: bool(state["compression_ready"]),
+            )
 
         _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -643,9 +663,15 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         lifespan=lifespan,
     )
 
+    _cors_origins = [
+        f"http://127.0.0.1:{config.gateway.port}",
+        f"http://localhost:{config.gateway.port}",
+        "http://127.0.0.1:18666",
+        "http://localhost:18666",
+    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_cors_origins,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -875,6 +901,10 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
             import shutil
             import subprocess
 
+            if not _is_safe_id(server_id):
+                return JSONResponse(
+                    {"error": "server_id 包含非法字符"}, status_code=400
+                )
             mcporter_bin = shutil.which("mcporter")
             shell_cmd = (
                 f"mcporter config remove {server_id}"
@@ -1588,6 +1618,7 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         name = str(body.get("name", "")).strip()
         message = str(body.get("message", "")).strip()
         kind = str(body.get("schedule_kind", "at")).lower()
+        session_id = str(body.get("session_id", "")).strip()
 
         if not message:
             return JSONResponse({"error": "缺少 message"}, status_code=400)
@@ -1637,11 +1668,12 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         else:
             return JSONResponse({"error": f"未知调度类型: {kind}"}, status_code=400)
 
+        action_target = session_id or "user"
         job = CronJob(
             id=f"cron-{uuid4().hex[:12]}",
             name=auto_name,
             schedule_obj=sched,
-            action=CronAction(type="message", target="user", payload={"text": message}),
+            action=CronAction(type="message", target=action_target, payload={"text": message}),
             enabled=True,
             created_at=now,
             one_shot=one_shot,
@@ -1705,11 +1737,13 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
 
         enabled = body.get("enabled", old.enabled)
 
+        session_id = str(body.get("session_id", "")).strip()
+        action_target = session_id or old.action.target or "user"
         updated = CronJob(
             id=old.id,
             name=name,
             schedule_obj=sched,
-            action=CronAction(type="message", target="user", payload={"text": message}),
+            action=CronAction(type="message", target=action_target, payload={"text": message}),
             enabled=bool(enabled),
             created_at=old.created_at,
             one_shot=one_shot,
@@ -1925,20 +1959,25 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
     async def _api_upload_file(file: UploadFile) -> JSONResponse:
         if not file.filename:
             return JSONResponse({"error": "文件名为空"}, status_code=400)
-        dest = _UPLOAD_DIR / file.filename
+        safe_name = _secure_filename(file.filename)
+        if not safe_name:
+            return JSONResponse({"error": "文件名无效"}, status_code=400)
+        dest = _UPLOAD_DIR / safe_name
         with dest.open("wb") as f:
             shutil.copyfileobj(file.file, f)
         return JSONResponse(
             {
-                "url": f"/api/files/{file.filename}",
-                "filename": file.filename,
+                "url": f"/api/files/{safe_name}",
+                "filename": safe_name,
                 "size": dest.stat().st_size,
             }
         )
 
     @app.get("/api/files/{filename}", response_model=None)
     async def _api_get_file(filename: str) -> FileResponse | JSONResponse:
-        path = _UPLOAD_DIR / filename
+        path = (_UPLOAD_DIR / filename).resolve()
+        if not str(path).startswith(str(_UPLOAD_DIR.resolve())):
+            return JSONResponse({"error": "非法路径"}, status_code=403)
         if not path.is_file():
             return JSONResponse({"error": "文件不存在"}, status_code=404)
         return FileResponse(path)
@@ -1976,6 +2015,17 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
                         return candidate
         return None
 
+    _LOCAL_FILE_ALLOWED_ROOTS = [
+        WHALECLAW_HOME.resolve(),
+        _UPLOAD_DIR.resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+    ]
+
+    def _is_safe_local_file_path(fp: Path) -> bool:
+        """Check that resolved path falls under an allowed root."""
+        resolved = str(fp.resolve())
+        return any(resolved.startswith(str(root)) for root in _LOCAL_FILE_ALLOWED_ROOTS)
+
     @app.get("/api/local-file", response_model=None)
     async def _api_get_local_file(
         path: str,
@@ -1986,6 +2036,9 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         if not fp:
             log.warning("local-file.not_found", path=path)
             return JSONResponse({"error": "文件不存在"}, status_code=404)
+        if not _is_safe_local_file_path(fp):
+            log.warning("local-file.blocked", path=path, resolved=str(fp))
+            return JSONResponse({"error": "路径不在允许范围内"}, status_code=403)
         if download:
             return FileResponse(
                 fp,
@@ -2000,6 +2053,8 @@ def create_app(config: WhaleclawConfig) -> FastAPI:
         fp = _resolve_local_path(path)
         if not fp:
             return JSONResponse({"error": "文件不存在"}, status_code=404)
+        if not _is_safe_local_file_path(fp):
+            return JSONResponse({"error": "路径不在允许范围内"}, status_code=403)
         size = fp.stat().st_size
         return JSONResponse(
             {

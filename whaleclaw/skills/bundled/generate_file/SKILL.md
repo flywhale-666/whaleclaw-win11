@@ -32,3 +32,6 @@ lock_session: false
 - 不需要安装依赖（已预装 python-pptx / openpyxl / reportlab / python-docx / Pillow）
 - 保存到 `~/.whaleclaw/workspace/tmp/<有意义的文件名>.<后缀>`
 - 文件名仅保留中文/英文/数字/下划线
+- 先定版式 token 预算，再写内容：标题/要点/表格都先压缩，避免靠临时缩字号硬塞
+- 同一文件只允许 1 套主题字体 + 1 套字号层级，禁止每页/每段随意漂移
+- 小改已有 Office 文件时优先走对应编辑工具，避免整份重生成导致样式跑偏

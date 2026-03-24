@@ -29,6 +29,7 @@ lock_session: false
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+import unicodedata
 
 wb = Workbook()
 ws = wb.active
@@ -44,6 +45,12 @@ THIN_BORDER = Border(
     top=Side(style='thin', color='D0D5DD'), bottom=Side(style='thin', color='D0D5DD'))
 CENTER_ALIGN = Alignment(horizontal='center', vertical='center', wrap_text=True)
 LEFT_ALIGN = Alignment(horizontal='left', vertical='center', wrap_text=True)
+
+def text_units(value):
+    total = 0
+    for ch in str(value or ""):
+        total += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return total
 ```
 
 ## 表头与数据
@@ -66,8 +73,12 @@ for row_idx, row_data in enumerate(data, 2):
 
 # 列宽自适应
 for col_idx in range(1, len(headers) + 1):
-    max_len = max(len(str(ws.cell(row=r, column=col_idx).value or "")) for r in range(1, ws.max_row + 1))
-    ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len * 1.8 + 4, 10), 40)
+    max_len = max(text_units(ws.cell(row=r, column=col_idx).value) for r in range(1, ws.max_row + 1))
+    ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len * 0.9 + 4, 10), 28)
+
+ws.row_dimensions[1].height = 24
+for row_idx in range(2, ws.max_row + 1):
+    ws.row_dimensions[row_idx].height = 20
 
 ws.freeze_panes = "A2"
 ws.auto_filter.ref = ws.dimensions
@@ -138,3 +149,7 @@ def add_chart(ws, title, data_col, label_col=1):
 - 数据量>5行时加数据条/条件格式
 - 报表类配套至少1个图表
 - 多维度数据拆分多Sheet：`wb.create_sheet(title="xxx")`
+- 表头固定 11pt、正文固定 10pt；不要因列宽紧张去改字号
+- 先按字段类型排版：编号/日期/百分比居中，名称/备注左对齐，金额加 number_format
+- 单元格内容过长时优先换行和调列宽，不要合并大量单元格制造错位
+- 修改已有 Excel 优先 `xlsx_edit`，不要重建整表导致筛选、冻结、公式丢失

@@ -6,9 +6,31 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
+
 
 _MAX_AGGREGATED_CHARS = 200_000
 _MAX_TAIL_CHARS = 12_000
+
+
+class _ReadableStream(Protocol):
+    """Async readable stream (covers _CompatStreamReader)."""
+
+    async def read(self, size: int = -1) -> bytes: ...
+
+
+@runtime_checkable
+class SubprocessLike(Protocol):
+    """Minimal interface shared by asyncio.subprocess.Process and _CompatProcess."""
+
+    @property
+    def pid(self) -> int | None: ...
+    @property
+    def returncode(self) -> int | None: ...
+    async def communicate(self) -> tuple[bytes, bytes]: ...
+    async def wait(self) -> int: ...
+    def terminate(self) -> None: ...
+    def kill(self) -> None: ...
 
 
 @dataclass
@@ -18,7 +40,7 @@ class ProcessSession:
     id: str
     command: str
     cwd: str
-    process: asyncio.subprocess.Process
+    process: SubprocessLike
     started_at: float
     aggregated: str = ""
     last_poll_pos: int = 0
@@ -43,7 +65,7 @@ def _append_text(session: ProcessSession, text: str) -> None:
 
 async def _consume_stream(
     session: ProcessSession,
-    stream: asyncio.StreamReader | None,
+    stream: asyncio.StreamReader | _ReadableStream | None,
     *,
     label: str,
 ) -> None:
@@ -68,7 +90,7 @@ def register_background_process(
     *,
     command: str,
     cwd: str,
-    process: asyncio.subprocess.Process,
+    process: SubprocessLike,
 ) -> ProcessSession:
     session = ProcessSession(
         id=f"proc_{uuid.uuid4().hex[:10]}",

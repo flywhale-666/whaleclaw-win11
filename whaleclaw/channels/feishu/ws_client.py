@@ -25,7 +25,7 @@ from whaleclaw.utils.log import get_logger
 
 log = get_logger(__name__)
 
-_WS_OPEN_TIMEOUT = 30
+_WS_OPEN_TIMEOUT = 10
 _WS_PING_INTERVAL = 120
 
 

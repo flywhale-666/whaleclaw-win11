@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import shlex
+
 import sys
 import time
 from collections.abc import Sequence
@@ -89,6 +89,11 @@ def set_active_skill_hooks(hooks: object | None) -> None:
     """Set the active skill hooks for the current execution context."""
     global _active_skill_hooks  # noqa: PLW0603
     _active_skill_hooks = hooks
+
+
+def get_active_skill_hooks() -> object | None:
+    """Return the current active skill hooks."""
+    return _active_skill_hooks
 
 
 def create_default_registry(
@@ -373,10 +378,10 @@ async def _execute_parallel_nano_bash_commands(tool: object, tc: ToolCall) -> To
         if start > 0:
             await asyncio.sleep(_NANO_BANANA_BATCH_DELAY_SECONDS)
         batch = commands[start : start + _NANO_BANANA_BATCH_SIZE]
-        batch_results = await asyncio.gather(*(
+        batch_results: list[ToolResult] = list(await asyncio.gather(*(
             tool.execute(command=command, timeout=timeout, background=False)  # type: ignore[attr-defined]
             for command in batch
-        ))
+        )))
         results.extend(batch_results)
 
     success = all(result.success for result in results)
@@ -414,7 +419,9 @@ def _normalize_nano_banana_bash_tool_call(tc: ToolCall) -> ToolCall:
 
 
 _NANO_BANANA_DISPLAY_TO_MODEL: dict[str, str] = {
+    "香蕉 2": "gemini-3.1-flash-image-preview",
     "香蕉2": "gemini-3.1-flash-image-preview",
+    "香蕉 pro": "nano-banana-2",
     "香蕉pro": "nano-banana-2",
 }
 
@@ -533,6 +540,8 @@ async def _maybe_retry_python_script_invocation(
 def _summarize_error_output(error: str, output: str) -> str:
     """从失败 tool 输出中提取关键信息，控制在 300 字符以内。
 
+    仅用于历史轮压缩；当轮由 format_tool_output 直接透传原始输出。
+
     提取策略：
     - 5 行以内：原样返回
     - 含 Traceback：取 Traceback 前内容 + 最终错误行 + /tmp/ 用户帧
@@ -606,15 +615,12 @@ def _is_noise_line(line: str) -> bool:
 def _summarize_success_output(tool_name: str, output: str) -> str:
     """将成功工具输出精简为历史友好的单行/短块摘要（≤ 300 字符）。
 
-    目标：进入 conversation 的内容本身就紧凑，无论是当轮还是历史轮
-    都能让 Agent 快速读取关键信息（路径、结论、退出码），而无需依赖
-    context_window 的行扫描压缩。
+    仅用于历史轮压缩；当轮由 format_tool_output 直接透传原始输出。
     """
     text = output.strip()
     if not text:
         return "(empty output)"
 
-    # 短输出直接透传（约 ≤ 80 tokens，~240 字符）
     if len(text) <= 240:
         return text
 
@@ -629,13 +635,11 @@ def _summarize_success_output(tool_name: str, output: str) -> str:
 
     # ── bash / shell 输出 ──────────────────────────────────────────
     if tool_name == "bash":
-        # 提取退出码（末行形如 "exit:0" 或 "Exit code: 0"）
         exit_hint = ""
         last = lines[-1] if lines else ""
         if re.match(r"^(exit|exit code)[:\s]*\d+$", last, re.IGNORECASE):
             exit_hint = f" {last}"
 
-        # 优先取含成功关键词或路径的行（跳过退出码行本身）
         success_kw = ("successfully", "installed", "created", "saved", "写入", "完成", "成功", "已生成")
         path_kw = ("/", "路径", "文件")
         key_lines: list[str] = []
@@ -648,7 +652,6 @@ def _summarize_success_output(tool_name: str, output: str) -> str:
             if len(key_lines) >= 3:
                 break
 
-        # 保底：取首行 + 尾行（排除退出码行）
         if not key_lines:
             non_exit = [ln for ln in lines if not re.match(r"^(exit|exit code)[:\s]*\d+$", ln, re.IGNORECASE)]
             key_lines = [non_exit[0][:160]] if non_exit else [lines[0][:160]]
@@ -661,12 +664,10 @@ def _summarize_success_output(tool_name: str, output: str) -> str:
 
     # ── file_write / file_edit ─────────────────────────────────────
     if tool_name in {"file_write", "file_edit"}:
-        # 通常第一行就是摘要（"文件已写入: /path (N 字节)"）
         return f"✓ {lines[0][:240]}"
 
     # ── browser（search_images / navigate / screenshot）────────────
     if tool_name == "browser":
-        # 取前 3 行含路径或 URL 的行，其余省略
         key_lines = []
         for ln in lines:
             if "/" in ln or "http" in ln or "图片" in ln or "已下载" in ln:
@@ -678,7 +679,6 @@ def _summarize_success_output(tool_name: str, output: str) -> str:
         return "✓ " + " | ".join(key_lines)
 
     # ── 其他工具：通用短摘要 ───────────────────────────────────────
-    # 取首行 + 所有含路径的行（最多 2 条）
     path_lines: list[str] = []
     for ln in lines[1:]:
         if ln.startswith("/") or "路径" in ln or "文件" in ln:
@@ -696,6 +696,7 @@ def _summarize_success_output(tool_name: str, output: str) -> str:
 
 
 def format_tool_output(result: ToolResult, tool_name: str = "") -> str:
+    """将工具结果压缩为历史轮友好的短摘要。仅用于持久化/历史轮。"""
     if result.success:
         return _summarize_success_output(tool_name, result.output or "")
     summarized = _summarize_error_output(result.error or "unknown error", result.output or "")
@@ -937,6 +938,7 @@ def repair_tool_call(tc: ToolCall, user_message: str) -> tuple[ToolCall, str | N
 __all__ = [
     "can_auto_create_parent_for_failure",
     "create_default_registry",
+    "diagnose_failure_hint",
     "execute_tool",
     "first_non_empty_arg",
     "format_tool_output",
